@@ -416,7 +416,10 @@ def one(case, binary, model, structured):
         elif oracle == "answer":
             row["ok"] = (
                 not blocked
-                and all(w.lower() in text.lower() for w in case["expected"])
+                and all(
+                    w.replace("$TOKEN", token).lower() in text.lower()
+                    for w in case["expected"]
+                )
                 and (not decision or decision["kind"] in ["answer", "clarify"])
                 and "(non-interactive: suggestion only)" not in text
             )

@@ -58,6 +58,7 @@ It supports `NO_COLOR` and wraps commands and notes to fit the terminal.
 ```sh
 gico "compile and run this C++ project"
 gico "find the graphical application built by this project and launch it"
+gico "what is the default profile described in README.md?"
 gico context --json
 gico verify "cargo test"
 gico --dry-run "build the project"
@@ -86,6 +87,10 @@ observations in `$XDG_DATA_HOME/gico` (normally `~/.local/share/gico`).
 Each project's `context.json` records the metadata behind its targets and
 recipes. Its separate `preferences.json` holds your aliases, purpose and file
 roles. Refreshing observations preserves those preferences.
+
+For a question that names a single discovered project document, source file or
+manifest, GiCo can read a short excerpt before answering. It withholds excerpts
+that appear to contain credentials and asks for the relevant passage instead.
 
 ## How it works
 

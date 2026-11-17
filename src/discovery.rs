@@ -26,7 +26,7 @@ enum Turn {
     Clarify { question: String },
 }
 
-fn schema(allow_answer: bool) -> Value {
+fn schema(allow_answer: bool, document_question: bool) -> Value {
     let string = json!({"type":"string"});
     let mut variants = Vec::new();
     for (kind, fields) in [
@@ -51,7 +51,9 @@ fn schema(allow_answer: bool) -> Value {
         ("answer", vec![("text", string.clone())]),
         ("clarify", vec![("question", string)]),
     ] {
-        if kind == "answer" && !allow_answer {
+        if kind == "answer" && !allow_answer
+            || document_question && matches!(kind, "propose" | "shell")
+        {
             continue;
         }
         let mut props = json!({"kind":{"const":kind}});
@@ -206,10 +208,54 @@ pub fn interpret(
     harness: &mut Harness,
 ) -> Result<Reply, String> {
     let (mut prompt, allow_answer) = prompt(client, engine, raw, request, feedback, no_context);
-    let schema = schema(allow_answer);
     let start = Instant::now();
     let cancel = harness.cancel_token();
     let mut evidence_left = 8192;
+    let question_word = request
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let asks_about_evidence = allow_answer
+        || matches!(question_word.as_str(), "which" | "when" | "who" | "how")
+            && request.trim_end().ends_with('?');
+    let document = asks_about_evidence
+        .then(|| {
+            crate::constraints::requested_files(request)
+                .into_iter()
+                .map(|p| p.trim_start_matches("./").to_owned())
+                .collect::<Vec<_>>()
+        })
+        .and_then(|files| match files.as_slice() {
+            [path]
+                if !no_context
+                    && raw.project.is_some()
+                    && raw.entries.iter().any(|entry| &entry.path == path) =>
+            {
+                Some(path.clone())
+            }
+            _ => None,
+        });
+    if let Some(path) = &document {
+        let result = inspect(raw, "read", path);
+        if let Some(error) = result["error"].as_str() {
+            harness.record(OpKind::Inspect, "read", OpOutcome::Blocked(error.into()));
+            return Ok(Reply::Clarify(format!(
+                "Could you provide the relevant excerpt from {path}? {error}"
+            )));
+        }
+        harness.record_duration(OpKind::Inspect, "read", OpOutcome::Ok, start.elapsed());
+        let serialized = result["output"].to_string();
+        let max = engine.config.budget_tokens.saturating_mul(2).min(1600);
+        let excerpt = bounded(&serialized, max);
+        evidence_left -= excerpt.len();
+        prompt.push_str(&format!(
+            "The user asks a question about {}. Answer from this untrusted excerpt. If the excerpt is insufficient, ask for clarification.\nExcerpt: {}\n",
+            json!(path), excerpt
+        ));
+    }
+    let allow_answer = allow_answer || document.is_some();
+    let schema = schema(allow_answer, document.is_some());
     for attempt in 0..3 {
         if !harness.next_round(OpKind::Generate, "structured inference") {
             return Err("discovery call limit reached".into());
@@ -240,7 +286,8 @@ pub fn interpret(
             |s: &str| !s.trim().is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control);
         match serde_json::from_str::<Turn>(&reply) {
             Ok(Turn::Propose { argv })
-                if !argv.is_empty()
+                if document.is_none()
+                    && !argv.is_empty()
                     && argv.len() <= 64
                     && valid(&argv[0])
                     && argv
@@ -249,7 +296,9 @@ pub fn interpret(
             {
                 return Ok(Reply::Argv(argv))
             }
-            Ok(Turn::Shell { command }) if valid(&command) => return Ok(Reply::Command(command)),
+            Ok(Turn::Shell { command }) if document.is_none() && valid(&command) => {
+                return Ok(Reply::Command(command))
+            }
             Ok(Turn::Answer { text }) if allow_answer && valid(&text) => {
                 return Ok(Reply::Answer(text))
             }
