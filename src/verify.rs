@@ -333,7 +333,7 @@ pub(crate) fn literal_words(command: &str) -> Option<Vec<String>> {
     quote.is_none().then(|| shlex::split(command)).flatten()
 }
 
-pub(crate) fn navigation_target(command: &str, cwd: &Path) -> Option<PathBuf> {
+pub fn navigation_target(command: &str, cwd: &Path) -> Option<PathBuf> {
     let words = literal_words(command)?;
     let [program, destination] = words.as_slice() else {
         return None;
@@ -729,12 +729,22 @@ pub(crate) fn existing_paths(command: &str, cwd: &Path) -> Vec<(PathBuf, PathBuf
             .words
             .iter()
             .skip_while(|word| is_env_assignment(word));
-        for word in words.chain(
-            command
-                .redirects
-                .iter()
-                .filter_map(|(op, word)| (*op == "<").then_some(word)),
-        ) {
+        if let Some(program) = words.clone().next().filter(|w| !w.contains('/')) {
+            if let Some(p) = std::env::var_os("PATH").and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|parent| cwd.join(parent).join(program))
+                    .find(|p| {
+                        use std::os::unix::fs::PermissionsExt;
+                        p.metadata()
+                            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    })
+            }) {
+                if let Ok(target) = p.canonicalize() {
+                    found.push((p, target));
+                }
+            }
+        }
+        for word in words.chain(command.redirects.iter().map(|(_, word)| word)) {
             if word == "-" || looks_like_flag(word) || word.chars().any(char::is_control) {
                 continue;
             }
@@ -787,6 +797,20 @@ pub fn verify(command: &str, cwd: &Path, known: &[FileEntry]) -> Report {
         });
     }
 
+    if cwd.to_string_lossy().contains(char::is_whitespace)
+        && toks
+            .iter()
+            .any(|token| matches!(token, Tok::Subst(inner) if inner.trim() == "pwd"))
+    {
+        issues.push(Issue {
+            severity: Severity::Error,
+            message: "unquoted working directory substitution splits a path containing spaces"
+                .into(),
+            suggestion: Some(
+                "pass the working directory as a literal argument or use double-quoted $PWD".into(),
+            ),
+        });
+    }
     issues.extend(pipe_to_shell_check(&toks));
 
     let cmds = match parse(&toks) {
@@ -831,6 +855,18 @@ pub fn verify(command: &str, cwd: &Path, known: &[FileEntry]) -> Report {
         let prog_idx = c.words.iter().position(|w| !is_env_assignment(w));
         let Some(idx) = prog_idx else { continue };
         let prog = &c.words[idx];
+        if c.words.len() == idx + 1
+            && matches!(
+                Path::new(prog).file_name().and_then(|n| n.to_str()),
+                Some("basename" | "dirname" | "cp" | "mv" | "mkdir" | "touch" | "chmod" | "chown")
+            )
+        {
+            issues.push(Issue {
+                severity: Severity::Error,
+                message: format!("missing required operand for '{prog}'"),
+                suggestion: Some("supply the requested filename or directory".into()),
+            });
+        }
         if !prog.contains('/') && !env::command_available(prog) {
             issues.push(Issue {
                 severity: Severity::Error,
@@ -864,6 +900,19 @@ pub fn verify(command: &str, cwd: &Path, known: &[FileEntry]) -> Report {
                 ]
                 .iter()
                 .any(|b| command.contains(b));
+            if p.exists() && !built_inline && !produced_here {
+                use std::os::unix::fs::PermissionsExt;
+                if !p
+                    .metadata()
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                {
+                    issues.push(Issue {
+                        severity: Severity::Error,
+                        message: format!("program is not an executable file: '{prog}'"),
+                        suggestion: None,
+                    });
+                }
+            }
             if !p.exists() && !produced_here && !built_inline {
                 issues.push(Issue {
                     severity: Severity::Error,
@@ -1070,6 +1119,71 @@ pub(crate) fn intent_issues_at(request: &str, command: &str, cwd: &Path) -> Vec<
                 suggestion: Some("resolve the directory from the filesystem first".into()),
             }]
         };
+    }
+    let lower = request.to_ascii_lowercase();
+    if !matches!(
+        intent,
+        Intent::Build
+            | Intent::Run
+            | Intent::BuildAndRun
+            | Intent::Test
+            | Intent::Clean
+            | Intent::Explain
+            | Intent::RepairCommand
+    ) && !lower.contains("extension")
+        && !crate::constraints::preserves_files(request, command)
+        && !crate::constraints::requested_files(request).is_empty()
+    {
+        return vec![Issue {
+            severity: Severity::Error,
+            message: "command does not address the requested literal file".into(),
+            suggestion: Some("retain the requested path as one operand".into()),
+        }];
+    }
+    let read_only = matches!(
+        intent,
+        Intent::Explain
+            | Intent::ListDir
+            | Intent::InspectProcess
+            | Intent::InspectPort
+            | Intent::GitLog
+            | Intent::GitDiff
+            | Intent::GitStatus
+            | Intent::MemoryInfo
+            | Intent::DiskUsage
+    ) && ![
+        "save ", "write ", "create ", "replace ", "commit ", "install ", "remove ", "delete ",
+        "move ", "append ", "copy ",
+    ]
+    .iter()
+    .any(|verb| lower.contains(verb));
+    if read_only {
+        let commands = lex(command).and_then(|t| parse(&t)).unwrap_or_default();
+        let writes = commands.iter().any(|c| {
+            c.redirects
+                .iter()
+                .any(|(op, dest)| op.contains('>') && dest != "/dev/null")
+                || c.words.first().is_some_and(|p| {
+                    matches!(
+                        Path::new(p).file_name().and_then(|n| n.to_str()),
+                        Some(
+                            "rm" | "mv"
+                                | "touch"
+                                | "tee"
+                                | "chmod"
+                                | "chown"
+                                | "kill"
+                                | "dd"
+                                | "mkdir"
+                                | "install"
+                                | "sudo"
+                        )
+                    )
+                })
+        });
+        if writes {
+            return vec![Issue{severity:Severity::Error,message:"this inspection request does not authorize the proposed write or process change".into(),suggestion:None}];
+        }
     }
     if !matches!(
         intent,

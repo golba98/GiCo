@@ -669,3 +669,24 @@ fn pty_restores_terminal_modes_after_cancel_and_before_execution() {
         assert_eq!(session.wait(), Some(0));
     }
 }
+
+#[test]
+fn pty_rejects_a_program_replaced_in_place_after_preview() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = fixture_dir();
+    let path = tmp.path().join("tool");
+    std::fs::write(&path, "#!/bin/sh\necho original\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut s = spawn_gico(tmp.path(), "./tool");
+    assert!(s
+        .read_until("↵ run", Duration::from_secs(5))
+        .contains("↵ run"));
+    std::fs::write(&path, "#!/bin/sh\ntouch surprise\n").unwrap();
+    s.send("\r");
+    assert!(s
+        .read_until("input path changed", Duration::from_secs(5))
+        .contains("input path changed"));
+    s.send("c");
+    assert_eq!(s.wait(), Some(0));
+    assert!(!tmp.path().join("surprise").exists());
+}

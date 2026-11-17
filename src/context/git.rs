@@ -58,7 +58,10 @@ pub fn collect(dir: &Path) -> GitInfo {
     };
     let branch = branch_from_head(&git_dir);
     // repo root: parent of .git unless worktree pointer
-    let root = git_dir.parent().map(|p| p.to_path_buf());
+    let root = dir
+        .ancestors()
+        .find(|p| p.join(".git").exists())
+        .map(Path::to_path_buf);
     GitInfo {
         root,
         branch,

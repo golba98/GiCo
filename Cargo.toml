@@ -1,6 +1,6 @@
 [package]
 name = "gico"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "GiCo - context-aware local AI terminal assistant for small local models"
 license = "MIT AND Apache-2.0"

@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use gico::config::Config;
 use gico::context::{ContextEngine, EngineConfig, RawScan};
 use gico::harness::pipeline::{self, Candidate, Dispatch, Preparation};
-use gico::harness::{CancelToken, Harness, InterruptGuard, OpKind, OpOutcome};
+use gico::harness::{Harness, InterruptGuard, OpKind, OpOutcome};
 use gico::llm::{Backend, LlmClient};
 use gico::verify::{self, Report, Verdict};
 use gico::{interact, ui};
@@ -31,7 +32,7 @@ struct Cli {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     request: Vec<String>,
 
-    /// Model name (overrides GICO_MODEL and config file). Never hard-coded.
+    /// Model name (overrides GICO_MODEL and config file).
     #[arg(long)]
     model: Option<String>,
 
@@ -54,6 +55,10 @@ struct Cli {
     /// Print the collected context and rendered prompt, do not call the model.
     #[arg(long)]
     dry_run: bool,
+
+    /// Print the verified decision as JSON without executing it.
+    #[arg(long)]
+    proposal_json: bool,
 
     /// Print collected context as JSON and exit.
     #[arg(long)]
@@ -113,34 +118,32 @@ enum Cmd {
     },
     /// List models available on the inference backend.
     Models,
+    /// Show the effective configuration, installed model and runtime state.
+    Status,
+    /// Associate a user-chosen name with the current project.
+    Alias { name: String },
+    /// Save these settings after verifying the model is installed.
+    Setup {
+        /// Enable approved directory changes and quiet interactive preload.
+        #[arg(long, conflicts_with = "remove_zsh")]
+        zsh: bool,
+        /// Remove GiCo's managed startup entry.
+        #[arg(long)]
+        remove_zsh: bool,
+    },
+    /// Warm the configured model using the provider's native idle timer.
+    Preload,
     /// Print the opt-in zsh integration snippet (eval "$(gico init-zsh)").
     InitZsh,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct FileConfig {
-    model: Option<String>,
-    backend: Option<String>,
-    endpoint: Option<String>,
-    budget_tokens: Option<usize>,
-}
-
-fn load_config(path: Option<PathBuf>) -> FileConfig {
-    let path = path.or_else(|| {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/gico/config.toml"))
-    });
-    let Some(p) = path else {
-        return FileConfig::default();
-    };
-    let Ok(data) = std::fs::read_to_string(p) else {
-        return FileConfig::default();
-    };
-    toml::from_str(&data).unwrap_or_default()
 }
 
 /// Runs the approved directory change in the calling Zsh process.
 const ZSH_HOOK_SNIPPET: &str = r#"# GiCo shell integration (opt-in). Add to ~/.zshrc:
 #   eval "$(gico init-zsh)"
+if [[ -o interactive && -t 0 && -t 1 && -n "$TTY" && "${GICO_TERMINAL:-}" != "$TTY" ]]; then
+  export GICO_TERMINAL="$TTY"
+  command gico preload </dev/null >/dev/null 2>&1 &!
+fi
 gico() {
   emulate -L zsh
   local handoff target
@@ -160,35 +163,63 @@ gico() {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let cfg = load_config(cli.config.clone());
-
-    let model = cli
-        .model
-        .clone()
-        .or_else(|| std::env::var("GICO_MODEL").ok())
-        .or(cfg.model.clone());
-    let backend_s = cli
-        .backend
-        .clone()
-        .or_else(|| std::env::var("GICO_BACKEND").ok())
-        .or(cfg.backend.clone())
-        .unwrap_or_else(|| "ollama".to_string());
-    let endpoint = cli
-        .endpoint
-        .clone()
-        .or_else(|| std::env::var("GICO_ENDPOINT").ok())
-        .or(cfg.endpoint.clone())
-        .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
-    let budget = cli
-        .budget
-        .or_else(|| {
-            std::env::var("GICO_BUDGET")
-                .ok()
-                .and_then(|v| v.parse().ok())
+    // Allow shell startup and version discovery even if the config needs repair.
+    if matches!(cli.command, Some(Cmd::InitZsh)) {
+        print!("{ZSH_HOOK_SNIPPET}");
+        return ExitCode::SUCCESS;
+    }
+    if matches!(
+        cli.command,
+        Some(Cmd::Setup {
+            remove_zsh: true,
+            ..
         })
-        .or(cfg.budget_tokens)
-        .unwrap_or(700);
-
+    ) {
+        return match gico::shell::configure(false) {
+            Ok(p) => {
+                println!("Updated {}", p.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => io_error("Zsh configuration", e),
+        };
+    }
+    let path = match cli
+        .config
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(gico::config::path)
+    {
+        Ok(path) => path,
+        Err(e) => return io_error("config location", e),
+    };
+    let mut cfg = match Config::load(&path) {
+        Ok(cfg) => cfg,
+        Err(e) => return io_error("configuration", e),
+    };
+    if let Some(value) = &cli.model {
+        cfg.model.clone_from(value);
+    }
+    if let Some(value) = &cli.backend {
+        cfg.backend.clone_from(value);
+    }
+    if let Some(value) = &cli.endpoint {
+        cfg.endpoint.clone_from(value);
+    }
+    if let Some(value) = cli.budget {
+        cfg.budget_tokens = value;
+    }
+    if let Some(value) = cli.temperature {
+        cfg.temperature = value;
+    }
+    if let Some(value) = cli.max_tokens {
+        cfg.max_tokens = value;
+    }
+    let mut client = match cfg.client() {
+        Ok(c) => c,
+        Err(e) => return io_error("configuration", e),
+    };
+    client.debug = cli.debug;
+    let budget = cfg.budget_tokens;
     let engine_cfg = EngineConfig {
         budget_tokens: budget,
         cache_dir: if cli.no_cache {
@@ -219,12 +250,105 @@ fn main() -> ExitCode {
             print!("{}", ZSH_HOOK_SNIPPET);
             ExitCode::SUCCESS
         }
+        Some(Cmd::Alias { name }) => {
+            let result = std::env::current_dir()
+                .and_then(|p| engine.scan(&p))
+                .and_then(|raw| {
+                    gico::context::registry::observe(&raw)?;
+                    gico::context::registry::alias(&raw.environment.cwd, &name)
+                });
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => io_error("save alias", e),
+            }
+        }
+        Some(Cmd::Preload) => match gico::lifecycle::warm(&cfg) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => io_error("preload", e),
+        },
+        Some(Cmd::Setup { .. } | Cmd::Status) => {
+            let setup = matches!(cli.command, Some(Cmd::Setup { .. }));
+            println!(
+                "config: {} ({})",
+                path.display(),
+                if path.exists() {
+                    "present"
+                } else {
+                    "using defaults"
+                }
+            );
+            println!("backend: {} at {}\nmodel: {}\ncontext: {} tokens; output: {}; temperature: {}\npreload: {}; idle: {}s",
+                cfg.backend,cfg.endpoint,cfg.model,cfg.context_size,cfg.max_tokens,cfg.temperature,cfg.preload,cfg.idle_seconds);
+            match client.list_models() {
+                Ok(models) if models.contains(&cfg.model) => (),
+                Ok(_) => {
+                    return io_error(
+                        "model missing",
+                        format!(
+                            "install {} on {} or select an installed model with --model",
+                            cfg.model, cfg.endpoint
+                        ),
+                    )
+                }
+                Err(e) => return io_error("service unavailable", e),
+            }
+            if client.backend == Backend::Ollama {
+                let details = match client.details() {
+                    Ok(data) => data,
+                    Err(e) => return io_error("model metadata", e),
+                };
+                println!(
+                    "Ollama {} · {} · digest {}",
+                    details["version"].as_str().unwrap_or("unknown"),
+                    details["quantization"].as_str().unwrap_or("unknown"),
+                    details["digest"].as_str().unwrap_or("unknown")
+                );
+                if details["capabilities"]
+                    .as_array()
+                    .is_some_and(|a| !a.iter().any(|v| v == "completion"))
+                {
+                    return io_error(
+                        "unsupported model",
+                        "select a local model with completion capability",
+                    );
+                }
+            }
+            if setup {
+                if matches!(cli.command, Some(Cmd::Setup { zsh: true, .. })) {
+                    if let Err(e) = gico::shell::configure(true) {
+                        return io_error("Zsh configuration", e);
+                    }
+                }
+                if let Err(e) = cfg.save(&path) {
+                    return io_error("save settings", e);
+                }
+            }
+            match client.backend {
+                Backend::Ollama => match client.resident() {
+                    Ok(value) => println!(
+                        "runner: {}",
+                        if value {
+                            "resident"
+                        } else {
+                            "unloaded or different context size"
+                        }
+                    ),
+                    Err(e) => return io_error("runner status", e),
+                },
+                Backend::OpenAiCompatible => {
+                    println!("runner: provider-managed; native preload unavailable")
+                }
+            }
+            ExitCode::SUCCESS
+        }
         Some(Cmd::Models) => {
-            let Some(backend) = Backend::parse(&backend_s) else {
+            let backend_s = &cfg.backend;
+            let endpoint = &cfg.endpoint;
+            let Some(_backend) = Backend::parse(backend_s) else {
                 eprintln!("gico: unknown backend '{backend_s}' (use ollama or llamacpp)");
                 return ExitCode::from(2);
             };
-            let client = LlmClient::new(backend, &endpoint, &model.clone().unwrap_or_default());
+
             match client.list_models() {
                 Ok(models) => {
                     for m in models {
@@ -255,7 +379,7 @@ fn main() -> ExitCode {
                 eprintln!("usage: gico \"<request>\"  (or: gico context | gico verify <cmd> | gico models)");
                 return ExitCode::from(2);
             }
-            run_request(&engine, &request, &cli, &model, &backend_s, &endpoint)
+            run_request(&engine, &request, &cli, client)
         }
     }
 }
@@ -325,10 +449,8 @@ fn print_report(report: &Report) {
 struct Generator<'a> {
     engine: &'a ContextEngine,
     cli: &'a Cli,
-    backend: Option<Backend>,
-    endpoint: &'a str,
-    model: Option<&'a str>,
-    client: std::cell::OnceCell<LlmClient>,
+    client: LlmClient,
+    loading_checked: std::cell::Cell<bool>,
 }
 
 impl Generator<'_> {
@@ -337,48 +459,35 @@ impl Generator<'_> {
         raw: &RawScan,
         request: &str,
         feedback: Option<(&str, &str)>,
-        cancel: &CancelToken,
-    ) -> Result<String, String> {
+        harness: &mut Harness,
+    ) -> Result<gico::discovery::Reply, String> {
         if let Ok(mock) = std::env::var("GICO_MOCK_COMMAND") {
-            return Ok(mock);
+            return Ok(gico::discovery::Reply::Command(mock));
         }
-        let backend = self.backend.ok_or("unknown backend")?;
-        let model = self.model.ok_or("no model configured")?;
-        let client = self.client.get_or_init(|| {
-            let mut client = LlmClient::new(backend, self.endpoint, model);
-            client.temperature = self.cli.temperature.unwrap_or(client.temperature);
-            client.max_tokens = self.cli.max_tokens.unwrap_or(client.max_tokens);
-            client
-        });
-        let prompt =
-            pipeline::generation_prompt(self.engine, raw, request, feedback, self.cli.no_context);
-        if self.cli.debug {
+        if !self.loading_checked.replace(true)
+            && self.client.backend == Backend::Ollama
+            && std::io::stderr().is_terminal()
+            && std::env::var_os("GICO_TERMINAL").is_some()
+            && self.client.resident().is_ok_and(|resident| !resident)
+        {
             eprintln!(
-                "--- prompt ---\n{}--- end prompt ---",
-                ui::safe_multiline(&prompt)
+                "  gico › loading {}",
+                ui::safe_multiline(&self.client.model)
             );
         }
-        let output = client
-            .complete_cancellable(&prompt, cancel)
-            .map_err(|error| error.to_string())?;
-        if self.cli.debug {
-            eprintln!(
-                "--- raw model output ---\n{}\n--- end ---",
-                ui::safe_multiline(&output)
-            );
-        }
-        Ok(output)
+        gico::discovery::interpret(
+            &self.client,
+            self.engine,
+            raw,
+            request,
+            feedback,
+            self.cli.no_context,
+            harness,
+        )
     }
 }
 
-fn run_request(
-    engine: &ContextEngine,
-    request: &str,
-    cli: &Cli,
-    model: &Option<String>,
-    backend_s: &str,
-    endpoint: &str,
-) -> ExitCode {
+fn run_request(engine: &ContextEngine, request: &str, cli: &Cli, client: LlmClient) -> ExitCode {
     let _interrupts = match InterruptGuard::install() {
         Ok(guard) => guard,
         Err(error) => return io_error("install cancellation handler", error),
@@ -386,14 +495,44 @@ fn run_request(
     let generator = Generator {
         engine,
         cli,
-        backend: Backend::parse(backend_s),
-        endpoint,
-        model: model.as_deref(),
-        client: std::cell::OnceCell::new(),
+        client,
+        loading_checked: Default::default(),
     };
     let mut harness = Harness::new(5);
     harness.enable_interrupts();
     let code = run_pipeline(&generator, request, &mut harness);
+    if code == 0
+        && cli.cd_hook_dir.is_some()
+        && std::io::stdin().is_terminal()
+        && std::env::var_os("GICO_TERMINAL").is_some()
+        && !harness
+            .ops()
+            .iter()
+            .any(|op| matches!(op.outcome, OpOutcome::Cancelled))
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            let mut warm = std::process::Command::new(exe);
+            if let Some(path) = &cli.config {
+                warm.arg("--config").arg(path);
+            }
+            warm.args([
+                "--model",
+                &generator.client.model,
+                "--backend",
+                match generator.client.backend {
+                    Backend::Ollama => "ollama",
+                    Backend::OpenAiCompatible => "llamacpp",
+                },
+                "--endpoint",
+                &generator.client.endpoint,
+                "preload",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+            let _ = warm.spawn();
+        }
+    }
     if cli.verbose || cli.debug {
         for op in harness.ops() {
             eprintln!(
@@ -440,10 +579,58 @@ fn run_pipeline(generator: &Generator<'_>, request: &str, harness: &mut Harness)
         Ok(cwd) => cwd,
         Err(error) => return io_error("resolve working directory", error),
     };
-    let raw = match scan(generator.engine, &cwd, harness) {
+    let selected = match gico::context::registry::project_for(&cwd, request) {
+        Ok(p) => p,
+        Err(question) => {
+            if cli.proposal_json {
+                println!("{}", serde_json::json!({"kind":"clarify","text":question}));
+                return 0;
+            }
+            if !interactive {
+                println!("{}", ui::render_info_at_width(&question, "", width, &style));
+                return 0;
+            }
+            let guard = match interact::enable_raw_mode() {
+                Ok(g) => g,
+                Err(e) => return io_error("clarification", e),
+            };
+            let prompt =
+                ui::render_prompt_line(&format!("{} ›", ui::safe_multiline(&question)), "", &style);
+            let answer = interact::read_line(&prompt, "");
+            drop(guard);
+            let Ok(Some(answer)) = answer else { return 130 };
+            let answer = answer.trim();
+            let explicit = PathBuf::from(answer);
+            if explicit.is_absolute() && explicit.is_dir() {
+                Some(explicit)
+            } else {
+                match gico::context::registry::project_for(&cwd, &format!("go to {answer}")) {
+                    Ok(Some(path)) => Some(path),
+                    _ => {
+                        return io_error(
+                            "project location",
+                            "could not resolve that choice; specify an existing project path",
+                        )
+                    }
+                }
+            }
+        }
+    };
+    let nav = gico::intent::navigation_destination(request).is_some();
+    let workdir = if nav {
+        &cwd
+    } else {
+        selected.as_ref().unwrap_or(&cwd)
+    };
+    let raw = match scan(generator.engine, workdir, harness) {
         Ok(raw) => raw,
         Err(error) => return io_error("inspect working directory", error),
     };
+    if !cli.no_cache {
+        if let Err(e) = gico::context::registry::observe(&raw) {
+            eprintln!("gico: project context unavailable: {e}");
+        }
+    }
     if cli.json || cli.dry_run || cli.verbose || cli.debug {
         let ctx = generator.engine.context_from_scan(&raw, request);
         if cli.json {
@@ -452,8 +639,15 @@ fn run_pipeline(generator: &Generator<'_>, request: &str, harness: &mut Harness)
         }
         if cli.dry_run {
             print_context(&ctx);
-            let prompt =
-                pipeline::generation_prompt(generator.engine, &raw, request, None, cli.no_context);
+            let prompt = gico::discovery::prompt(
+                &generator.client,
+                generator.engine,
+                &raw,
+                request,
+                None,
+                cli.no_context,
+            )
+            .0;
             eprintln!("--- prompt ---\n{}", ui::safe_multiline(&prompt));
             return 0;
         }
@@ -469,9 +663,76 @@ fn run_pipeline(generator: &Generator<'_>, request: &str, harness: &mut Harness)
             }
         }
     }
-    let prepared = pipeline::prepare(harness, &raw, request, |feedback, cancel| {
-        generator.generate(&raw, request, feedback, cancel)
-    });
+    if workdir != &cwd && !cli.proposal_json {
+        println!(
+            "{}",
+            ui::render_info_at_width(
+                "Working directory",
+                &workdir.display().to_string(),
+                width,
+                &style
+            )
+        );
+    }
+    let mut prepared = if let Some(target) = selected.as_ref().filter(|_| nav) {
+        Preparation::Candidate(pipeline::verify_candidate(
+            harness,
+            &raw,
+            request,
+            format!(
+                "cd {}",
+                gico::context::fs::shell_quote(&target.to_string_lossy())
+            ),
+            None,
+        ))
+    } else {
+        pipeline::prepare(harness, &raw, request, |feedback, cancel| {
+            generator.generate(&raw, request, feedback, cancel)
+        })
+    };
+    if cli.proposal_json {
+        let obj = match &prepared {
+            Preparation::Candidate(c) => {
+                serde_json::json!({"kind":"proposal","cwd":workdir,"command":c.command,"argv":c.argv(),"verdict":c.report.verdict(),"issues":c.report.issues,"note":c.note})
+            }
+            Preparation::Information { title, detail } => {
+                serde_json::json!({"kind":"answer","text":format!("{title} {detail}")})
+            }
+            Preparation::Clarify(q) => serde_json::json!({"kind":"clarify","text":q}),
+            Preparation::Failed(e) => serde_json::json!({"kind":"failed","text":e}),
+            Preparation::Cancelled => return 130,
+        };
+        println!("{obj}");
+        return if matches!(prepared, Preparation::Failed(_)) {
+            2
+        } else {
+            0
+        };
+    }
+    let mut clarified = request.to_owned();
+    if let Preparation::Clarify(question) = &prepared {
+        if !interactive {
+            println!("{}", ui::render_info_at_width(question, "", width, &style));
+            return 0;
+        }
+        let guard = match interact::enable_raw_mode() {
+            Ok(v) => v,
+            Err(e) => return io_error("clarification", e),
+        };
+        let question =
+            ui::render_prompt_line(&format!("{} ›", ui::safe_multiline(question)), "", &style);
+        let answer = interact::read_line(&question, "");
+        drop(guard);
+        let Ok(Some(answer)) = answer else {
+            return 130;
+        };
+        clarified.push_str("\nClarification: ");
+        clarified.push_str(&answer);
+        prepared = pipeline::prepare(harness, &raw, &clarified, |feedback, h| {
+            generator.generate(&raw, &clarified, feedback, h)
+        });
+    }
+    let request = clarified.as_str();
     let (candidate, last_exit) = match prepared {
         Preparation::Candidate(candidate) => (candidate, None),
         Preparation::Information { title, detail } => {
@@ -479,6 +740,10 @@ fn run_pipeline(generator: &Generator<'_>, request: &str, harness: &mut Harness)
                 "{}",
                 ui::render_info_at_width(&title, &detail, width, &style)
             );
+            return 0;
+        }
+        Preparation::Clarify(question) => {
+            println!("{}", ui::render_info_at_width(&question, "", width, &style));
             return 0;
         }
         Preparation::Cancelled => return 130,
@@ -522,7 +787,17 @@ fn run_pipeline(generator: &Generator<'_>, request: &str, harness: &mut Harness)
         println!("(non-interactive: suggestion only)");
         return 0;
     }
-    interact_request(generator, request, harness, raw, candidate, last_exit)
+    let selected = selected.unwrap_or_else(|| raw.environment.cwd.clone());
+    let code = interact_request(generator, request, harness, raw, candidate, last_exit);
+    if code == 0
+        && harness
+            .ops()
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::Execute) && matches!(op.outcome, OpOutcome::Ok))
+    {
+        gico::context::registry::remember(&selected);
+    }
+    code
 }
 
 fn interact_request(
@@ -613,6 +888,11 @@ fn interact_request(
                 let elapsed = started.elapsed().as_millis();
                 match outcome {
                     Ok(Dispatch::Navigation) => {
+                        if let Some(target) =
+                            verify::navigation_target(&candidate.command, &raw.environment.cwd)
+                        {
+                            gico::context::registry::remember(&target);
+                        }
                         harness.record_ms(
                             OpKind::Navigate,
                             "handed off to the parent shell",
@@ -732,9 +1012,9 @@ fn interact_request(
                         }
                         candidate = new;
                     }
-                    Preparation::Information { title, .. } | Preparation::Failed(title) => {
-                        candidate.note = Some(title)
-                    }
+                    Preparation::Information { title, .. }
+                    | Preparation::Clarify(title)
+                    | Preparation::Failed(title) => candidate.note = Some(title),
                     Preparation::Cancelled => return 130,
                 }
                 raw_guard = match interact::enable_raw_mode() {

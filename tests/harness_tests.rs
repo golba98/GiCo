@@ -171,6 +171,47 @@ fn navigate_dir_tests_serial() {
     let issues = verify::intent_issues(req, &p.command);
     assert!(issues.is_empty(), "issues: {issues:?}");
 
+    let target = fake_home.path().join("Development/5-C++/4-IT Pixel Forger");
+    let sibling = target.with_file_name("4-IT Pixel Generator");
+    std::fs::create_dir_all(&sibling).unwrap();
+    let req = "change the directory to where 4-IT pixel forger is";
+    assert_eq!(intent::classify_str(req), Intent::NavigateDir);
+    assert!(plan::plan(&raw, req).unwrap().command.is_empty());
+    std::fs::create_dir(&target).unwrap();
+    let expected = format!("cd '{}'", target.display());
+    assert_eq!(plan::plan(&raw, req).unwrap().command, expected);
+    std::fs::create_dir(fake_home.path().join("4-IT PIXEL FORGER")).unwrap();
+    assert!(plan::plan(&raw, req).unwrap().command.is_empty());
+
+    write(fake_home.path(), "prism-llama.cpp/CMakeLists.txt", "");
+    write(&target, "CMakeLists.txt", "");
+    let other = fake_home
+        .path()
+        .join("Development/3-Python/4-IT Pixel Generator");
+    std::fs::create_dir_all(&other).unwrap();
+    for request in ["go to It pixel gen cpp", "go to it puixel gen cpp"] {
+        let planned = plan::plan(&raw, request).unwrap();
+        assert_eq!(planned.command, format!("cd '{}'", sibling.display()));
+    }
+    assert!(plan::plan(&raw, "go to it pixel gen")
+        .unwrap()
+        .command
+        .is_empty());
+    assert!(plan::plan(&raw, "go to it pixel missing cpp")
+        .unwrap()
+        .command
+        .is_empty());
+    let unrelated = fake_home
+        .path()
+        .join("Development/1-JavaScript/Lunar Dashboard");
+    std::fs::create_dir(&unrelated).unwrap();
+    assert_eq!(
+        plan::plan(&raw, "go to luanr dash javascript")
+            .unwrap()
+            .command,
+        format!("cd '{}'", unrelated.display())
+    );
+
     // 2. unresolvable request explains instead of inventing a path
     let raw = engine().scan(fake_home.path()).unwrap();
     let p = plan::plan(&raw, "go to my quantum-zebra workshop").expect("plan");
@@ -248,4 +289,41 @@ fn plan_uses_the_selected_targets_docs_without_running_its_help() {
         .iter()
         .any(|target| target.name == "core" && target.kind == TargetKind::Library));
     assert!(!kinds.iter().any(|target| target.name == "faux"));
+}
+
+#[test]
+fn return_home_uses_process_home_without_model_or_project_lookup() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("User Home");
+    let cwd = home.join("Development/An Unrelated Project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir(home.join("home")).unwrap();
+    for request in [
+        "go back to home diretory",
+        "go to my home directory",
+        "Go home",
+        "go back home",
+        "return to the home folder",
+        "cd ~",
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_gico"))
+            .args(["--no-cache", "--verbose", request])
+            .env("HOME", &home)
+            .env("GICO_ENDPOINT", "http://127.0.0.1:1")
+            .env_remove("GICO_MOCK_COMMAND")
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{request}: {output:?}");
+        let preview = String::from_utf8(output.stdout).unwrap();
+        let resolved = home.canonicalize().unwrap();
+        assert!(
+            preview.contains(&format!("cd '{}'", resolved.display())),
+            "{request}: {preview}"
+        );
+        let trace = String::from_utf8(output.stderr).unwrap();
+        assert!(trace.contains("op plan: deterministic"), "{trace}");
+        assert!(!trace.contains("op generate:"), "{trace}");
+    }
+    assert_eq!(intent::classify_str("go test"), Intent::Test);
 }
