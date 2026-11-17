@@ -25,11 +25,15 @@ fn collects_environment_facts() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = engine();
     let ctx = engine.collect_at(tmp.path(), "list files").unwrap();
-    assert!(!ctx.environment.os.is_empty());
-    assert!(
-        ctx.environment.os.to_lowercase().contains("linux")
-            || ctx.environment.os.to_lowercase().contains("fedora")
-    );
+    let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    if let Some(name) = os_release
+        .lines()
+        .find_map(|line| line.strip_prefix("PRETTY_NAME="))
+    {
+        assert_eq!(ctx.environment.os, name.trim_matches('"'));
+    } else {
+        assert!(!ctx.environment.os.is_empty());
+    }
     assert!(!ctx.environment.shell.is_empty());
     assert_eq!(ctx.environment.cwd, tmp.path());
     assert!(!ctx.environment.arch.is_empty());
