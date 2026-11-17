@@ -307,11 +307,10 @@ fn pty_empty_project_is_informational_no_controls() {
 
 #[test]
 fn pty_intent_mismatch_is_blocked_and_enter_never_runs_it() {
-    // Go project: the planner defers to the model here (no local plan), so the
-    // mock's irrelevant `cd .` reaches intent validation.
+    // A shell source has no build detector, so the mock reaches intent
+    // validation regardless of the compilers installed on the host.
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("go.mod"), "module example.com/x\n").unwrap();
-    std::fs::write(tmp.path().join("main.go"), "package main\n").unwrap();
+    std::fs::write(tmp.path().join("main.sh"), "echo hello\n").unwrap();
     let dir = tmp.path().to_path_buf();
     // Mock model insists on an irrelevant `cd` command for a build request.
     let mut s = spawn_gico_with(&dir, "compile and run this project", "cd .");
