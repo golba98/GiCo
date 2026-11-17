@@ -499,10 +499,11 @@ fn collect_evidence(root: &Path, dir: &Path, depth: usize, evidence: &mut Target
                 if let Some(index) = args.iter().position(|arg| arg == "PROPERTIES") {
                     for target in &args[..index] {
                         let properties = evidence.properties.entry(target.clone()).or_default();
+                        let (pairs, _) = args[index + 1..].as_chunks::<2>();
                         properties.extend(
-                            args[index + 1..]
-                                .chunks_exact(2)
-                                .map(|pair| (pair[0].clone(), pair[1].clone())),
+                            pairs
+                                .iter()
+                                .map(|[key, value]| (key.clone(), value.clone())),
                         );
                     }
                 }
