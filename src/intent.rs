@@ -75,6 +75,64 @@ pub fn classify_str(request: &str) -> Intent {
     classify(request, &RawScan::default_for_intent())
 }
 
+/// Extract the user's destination while preserving literal path case.
+pub fn navigation_destination(request: &str) -> Option<&str> {
+    fn strip_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+        text.get(..prefix.len())?
+            .eq_ignore_ascii_case(prefix)
+            .then(|| text[prefix.len()..].trim_start())
+    }
+    let request = request.trim();
+    let request = strip_prefix(request, "please ").unwrap_or(request);
+    [
+        "change the directory to ",
+        "change directory to ",
+        "change to ",
+        "go back to ",
+        "go to ",
+        "return to ",
+        "take me to ",
+        "cd to ",
+        "cd ",
+        "navigate to ",
+        "switch to ",
+        "open the directory ",
+        "browse to ",
+        "go back ",
+        "go ",
+    ]
+    .iter()
+    .find_map(|prefix| {
+        let destination = strip_prefix(request, prefix)?;
+        // Bare "go" is also a tool name, as in "go test".
+        if matches!(*prefix, "go " | "go back ") && !is_home_destination(destination) {
+            return None;
+        }
+        Some(destination)
+    })
+}
+
+pub(crate) fn is_home_destination(destination: &str) -> bool {
+    let lower = destination
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase();
+    let mut words = lower.split_whitespace();
+    let mut first = words.next();
+    if matches!(first, Some("my" | "the")) {
+        first = words.next();
+    }
+    match (first, words.next(), words.next()) {
+        (Some("~" | "home"), None, None) => true,
+        (Some("home"), Some(noun), None) => {
+            matches!(noun, "folder" | "dir")
+                || (noun.len().abs_diff("directory".len()) <= 1
+                    && strsim::osa_distance(noun, "directory") <= 1)
+        }
+        _ => false,
+    }
+}
+
 pub fn classify(request: &str, scan: &RawScan) -> Intent {
     let r = request.to_lowercase();
     let has = |phrases: &[&str]| phrases.iter().any(|p| r.contains(p));
@@ -103,6 +161,14 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
     {
         return Intent::Explain;
     }
+    let destination = navigation_destination(request);
+    if destination.is_some_and(is_home_destination)
+        || ["change directory to ", "change the directory to "]
+            .iter()
+            .any(|prefix| r.trim_start().starts_with(prefix))
+    {
+        return Intent::NavigateDir;
+    }
     // Build/run/test/clean (existing semantics, phrase-tolerant).
     let build = has(&[
         "compile",
@@ -112,7 +178,13 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
         "link",
         "fix the build",
     ]);
-    let run = has(&["run", "execute", "launch", "start"]);
+    let run = has(&["run", "execute", "launch", "start"])
+        || r.split_whitespace()
+            .next()
+            .is_some_and(|w| w.len().abs_diff(6) <= 1 && strsim::osa_distance(w, "launch") <= 1);
+    if r.starts_with("where does ") || r.starts_with("what is this project") {
+        return Intent::Explain;
+    }
     let test = has(&["test", "testing"]);
     let clean = has(&["clean"]);
     if build && run {
@@ -133,7 +205,13 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
         if has(&["diff", "changes", "what changed", "uncommitted"]) {
             return Intent::GitDiff;
         }
-        if has(&["log", "recent commits", "history", "last commits"]) {
+        if has(&[
+            "log",
+            "recent commits",
+            "history",
+            "last commits",
+            "commits",
+        ]) {
             return Intent::GitLog;
         }
         if has(&["status", "branch", "branches", "repo"]) || r.contains("git") {
@@ -161,16 +239,18 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
         return Intent::MemoryInfo;
     }
     // Directory navigation.
-    if has(&[
-        "change to",
-        "cd to",
-        "go to",
-        "navigate to",
-        "switch to",
-        "take me to",
-        "open the directory",
-        "browse to",
-    ]) {
+    if destination.is_some()
+        || has(&[
+            "change to",
+            "cd to",
+            "go to",
+            "navigate to",
+            "switch to",
+            "take me to",
+            "open the directory",
+            "browse to",
+        ])
+    {
         return Intent::NavigateDir;
     }
     // Filesystem search/inspection.

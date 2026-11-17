@@ -8,21 +8,43 @@ use std::time::{Duration, Instant};
 use crate::context::{ContextEngine, RawScan};
 use crate::intent::{self, Intent};
 use crate::verify::{self, Issue, Report, Severity, Verdict};
-use crate::{llm, plan};
+use crate::{discovery::Reply, plan};
 
 use super::{exec_shell, ApprovalPolicy, CancelToken, ExecOutcome, Harness, OpKind, OpOutcome};
+
+#[derive(PartialEq)]
+struct FileIdentity(u64, u64, Option<(u64, i64, i64)>);
+fn fingerprint(path: &Path) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let md = path.metadata().ok()?;
+    Some(FileIdentity(
+        md.dev(),
+        md.ino(),
+        md.is_file()
+            .then(|| (md.len(), md.ctime(), md.ctime_nsec())),
+    ))
+}
 
 pub struct Candidate {
     pub command: String,
     pub report: Report,
     pub note: Option<String>,
     cwd: PathBuf,
-    paths: Vec<(PathBuf, PathBuf)>,
+    directory_identity: Option<FileIdentity>,
+    argv: Option<Vec<String>>,
+    paths: Vec<(PathBuf, PathBuf, FileIdentity)>,
+}
+
+impl Candidate {
+    pub fn argv(&self) -> Option<&[String]> {
+        self.argv.as_deref()
+    }
 }
 
 pub enum Preparation {
     Candidate(Candidate),
     Information { title: String, detail: String },
+    Clarify(String),
     Failed(String),
     Cancelled,
 }
@@ -33,6 +55,7 @@ pub enum Dispatch {
 }
 
 enum Operation {
+    Argv(Vec<String>),
     Shell(String),
     Navigate(PathBuf),
 }
@@ -51,6 +74,12 @@ impl ApprovedOperation {
         timeout: Duration,
     ) -> io::Result<Dispatch> {
         match self.operation {
+            Operation::Argv(argv) => {
+                let mut builder = std::process::Command::new(&argv[0]);
+                builder.args(&argv[1..]);
+                super::process::exec_process(builder, &self.cwd, cancel, timeout)
+                    .map(Dispatch::Shell)
+            }
             Operation::Shell(command) => {
                 exec_shell(&command, &self.cwd, cancel, timeout).map(Dispatch::Shell)
             }
@@ -144,14 +173,56 @@ pub fn verify_candidate(
     let paths = if report.verdict() == Verdict::Blocked {
         Vec::new()
     } else {
-        verify::existing_paths(&command, cwd)
+        let mut paths = verify::existing_paths(&command, cwd);
+        if matches!(
+            intent::classify(request, raw),
+            Intent::Build | Intent::BuildAndRun | Intent::Run | Intent::Test | Intent::Clean
+        ) {
+            for rel in raw
+                .entries
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.name.as_str(),
+                        "CMakeLists.txt"
+                            | "Cargo.toml"
+                            | "package.json"
+                            | "pyproject.toml"
+                            | "Makefile"
+                            | "CMakePresets.json"
+                    )
+                })
+                .map(|e| PathBuf::from(&e.path))
+                .chain(
+                    raw.cmake_build_dirs
+                        .iter()
+                        .map(|d| Path::new(d).join("CMakeCache.txt")),
+                )
+            {
+                let path = cwd.join(rel);
+                if let Ok(resolved) = path.canonicalize() {
+                    paths.push((path, resolved));
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .filter_map(|(p, r)| {
+                let id = fingerprint(&r)?;
+                Some((p, r, id))
+            })
+            .collect()
     };
     harness.record_duration(OpKind::Verify, &command, outcome, start.elapsed());
     Candidate {
         paths,
+        argv: None,
         command,
         report,
         note,
+        directory_identity: fingerprint(cwd),
         cwd: cwd.clone(),
     }
 }
@@ -188,7 +259,11 @@ pub fn authorize(
         harness.record(OpKind::Approve, command, OpOutcome::Cancelled);
         return Err("cancelled".into());
     }
-    if candidate.cwd != *cwd || !ApprovalPolicy::Ask.permits(answer, command) {
+    if candidate.report.verdict() == Verdict::Blocked
+        || candidate.cwd != *cwd
+        || fingerprint(cwd) != candidate.directory_identity
+        || !ApprovalPolicy::Ask.permits(answer, command)
+    {
         harness.record(
             OpKind::Approve,
             command,
@@ -196,8 +271,10 @@ pub fn authorize(
         );
         return Err("approval unavailable".into());
     }
-    for (path, resolved) in &candidate.paths {
-        if path.canonicalize().as_ref().ok() != Some(resolved) {
+    for (path, resolved, identity) in &candidate.paths {
+        if path.canonicalize().as_ref().ok() != Some(resolved)
+            || fingerprint(path).as_ref() != Some(identity)
+        {
             let message = format!("input path changed or does not exist: '{}'", path.display());
             harness.record(
                 OpKind::Approve,
@@ -208,6 +285,11 @@ pub fn authorize(
         }
     }
     let verified = verify_candidate(harness, raw, request, command.clone(), None);
+    if verified.paths != candidate.paths && verified.report.verdict() != Verdict::Blocked {
+        let reason = "resolved inputs changed since preview";
+        harness.record(OpKind::Approve, command, OpOutcome::Blocked(reason.into()));
+        return Err(reason.into());
+    }
     if verified.report.verdict() == Verdict::Blocked {
         let outcome = blocked(&verified.report);
         let message = verified.report.errors()[0].message.clone();
@@ -216,7 +298,11 @@ pub fn authorize(
     }
     let operation = match verify::navigation_target(command, cwd) {
         Some(target) => Operation::Navigate(target),
-        None => Operation::Shell(command.clone()),
+        None => candidate
+            .argv
+            .clone()
+            .map(Operation::Argv)
+            .unwrap_or_else(|| Operation::Shell(command.clone())),
     };
     harness.record(OpKind::Approve, command, OpOutcome::Ok);
     Ok(ApprovedOperation {
@@ -229,7 +315,7 @@ pub fn prepare(
     harness: &mut Harness,
     raw: &RawScan,
     request: &str,
-    mut generate: impl FnMut(Option<(&str, &str)>, &CancelToken) -> Result<String, String>,
+    mut generate: impl FnMut(Option<(&str, &str)>, &mut Harness) -> Result<Reply, String>,
 ) -> Preparation {
     if harness.cancel_token().is_cancelled() {
         harness.record(OpKind::Plan, "initial preparation", OpOutcome::Cancelled);
@@ -248,6 +334,9 @@ pub fn prepare(
             start.elapsed().as_millis(),
         );
         if plan.command.is_empty() {
+            if let Some(note) = plan.note.as_ref().filter(|n| n.starts_with("Which ")) {
+                return Preparation::Clarify(note.clone());
+            }
             return Preparation::Information {
                 title: plan.note.unwrap_or_else(|| "No verified command.".into()),
                 detail: String::new(),
@@ -271,6 +360,11 @@ pub fn prepare(
         || !errors.iter().all(|issue| {
             issue.message.contains("does not address the request")
                 || issue.message.contains("irrelevant to the request")
+                || issue.message.contains("file not found")
+                || issue.message.contains("path does not exist")
+                || issue.message.contains("requested literal file")
+                || issue.message.contains("missing required operand")
+                || issue.message.contains("unquoted working directory")
         })
     {
         return Preparation::Candidate(candidate);
@@ -287,29 +381,39 @@ pub fn generate_candidate(
     raw: &RawScan,
     request: &str,
     refinement: Option<&str>,
-    generate: impl FnOnce(&CancelToken) -> Result<String, String>,
+    generate: impl FnOnce(&mut Harness) -> Result<Reply, String>,
 ) -> Preparation {
     let kind = if refinement.is_some() {
         OpKind::Refine
     } else {
         OpKind::Generate
     };
-    if !harness.next_round(kind, "model call") {
-        return if harness.cancel_token().is_cancelled() {
-            Preparation::Cancelled
-        } else {
-            Preparation::Failed("model call limit reached".into())
-        };
-    }
     let start = Instant::now();
     let cancel = harness.cancel_token();
-    let generated = generate(&cancel);
+    let generated = generate(harness);
     let (outcome, result) = if cancel.is_cancelled() {
         (OpOutcome::Cancelled, Preparation::Cancelled)
     } else {
         match generated {
-            Ok(output) => {
-                let command = llm::extract_command(&output);
+            Ok(Reply::Argv(argv)) => {
+                let command = argv
+                    .iter()
+                    .map(|a| crate::context::fs::shell_quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut candidate = verify_candidate(harness, raw, request, command, None);
+                candidate.argv = Some(argv);
+                (OpOutcome::Ok, Preparation::Candidate(candidate))
+            }
+            Ok(Reply::Answer(title)) => (
+                OpOutcome::Ok,
+                Preparation::Information {
+                    title,
+                    detail: String::new(),
+                },
+            ),
+            Ok(Reply::Clarify(question)) => (OpOutcome::Ok, Preparation::Clarify(question)),
+            Ok(Reply::Command(command)) => {
                 if command.is_empty() {
                     let message = "the model returned an empty response".to_string();
                     (
@@ -327,7 +431,7 @@ pub fn generate_candidate(
                 } else {
                     harness.record_ms(
                         kind,
-                        "model call",
+                        "candidate generation",
                         OpOutcome::Ok,
                         start.elapsed().as_millis(),
                     );
@@ -339,7 +443,12 @@ pub fn generate_candidate(
             Err(error) => (OpOutcome::Failed(error.clone()), Preparation::Failed(error)),
         }
     };
-    harness.record_ms(kind, "model call", outcome, start.elapsed().as_millis());
+    harness.record_ms(
+        kind,
+        "candidate generation",
+        outcome,
+        start.elapsed().as_millis(),
+    );
     result
 }
 

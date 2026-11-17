@@ -152,7 +152,13 @@ const INJECTION_MARKERS: &[&str] = &[
 /// True if a basename refers to a sensitive file/directory we must never expose.
 pub fn is_sensitive(name: &str, is_dir: bool) -> bool {
     let lower = name.to_lowercase();
-    if is_dir && SENSITIVE_DIRS.contains(&lower.as_str()) {
+    if is_dir
+        && (SENSITIVE_DIRS.contains(&lower.as_str())
+            || matches!(
+                lower.as_str(),
+                ".private" | ".git" | ".ollama" | ".codex" | ".config" | ".local"
+            ))
+    {
         return true;
     }
     if SENSITIVE_NAMES.contains(&lower.as_str()) {

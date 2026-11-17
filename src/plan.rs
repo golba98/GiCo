@@ -33,12 +33,19 @@ pub fn plan(raw: &RawScan, request: &str) -> Option<Plan> {
             note: Some("No verified matching executable was found in this project.".into()),
         });
     }
-    match intent {
+    let plan = match intent {
         Intent::Build | Intent::Run | Intent::BuildAndRun | Intent::Test | Intent::Clean => {
             project_plan(raw, request, intent)
         }
         other => general_plan(raw, request, other),
+    }?;
+    if !plan.command.is_empty()
+        && intent != Intent::NavigateDir
+        && !crate::constraints::shortcut_fits(raw, intent, request, &plan.command)
+    {
+        return None;
     }
+    Some(plan)
 }
 
 // ---------------------------------------------------------------------------
@@ -46,13 +53,78 @@ pub fn plan(raw: &RawScan, request: &str) -> Option<Plan> {
 // ---------------------------------------------------------------------------
 
 fn general_plan(raw: &RawScan, request: &str, intent: Intent) -> Option<Plan> {
+    let lower = request.to_lowercase();
+    let words: Vec<_> = lower
+        .trim_end_matches(['?', '!', '.'])
+        .split_whitespace()
+        .collect();
+    let count = words
+        .iter()
+        .any(|w| matches!(*w, "count" | "many" | "number"));
+    let qualified = words.iter().any(|w| {
+        matches!(
+            *w,
+            "only"
+                | "except"
+                | "excluding"
+                | "under"
+                | "within"
+                | "matching"
+                | "older"
+                | "newer"
+                | "named"
+                | "from"
+                | "since"
+                | "by"
+                | "containing"
+                | "ending"
+                | "starting"
+                | "without"
+        ) || w.contains('/')
+    });
+    if qualified && !matches!(intent, Intent::NavigateDir | Intent::GitLog) {
+        return None;
+    }
+    if count && intent != Intent::InspectProcess {
+        return None;
+    }
     match intent {
-        Intent::ListDir => Some(Plan {
-            command: "ls -la".to_string(),
-            note: None,
-        }),
+        Intent::ListDir
+            if words.iter().all(|w| {
+                matches!(
+                    *w,
+                    "list"
+                        | "ls"
+                        | "all"
+                        | "the"
+                        | "files"
+                        | "file"
+                        | "in"
+                        | "this"
+                        | "directory"
+                        | "folder"
+                        | "here"
+                        | "what"
+                        | "is"
+                        | "what's"
+                        | "show"
+                        | "me"
+                        | "contents"
+                        | "of"
+                        | "current"
+                        | "detailed"
+                        | "listing"
+                        | "a"
+                )
+            }) =>
+        {
+            Some(Plan {
+                command: "ls -la".to_string(),
+                note: None,
+            })
+        }
         Intent::SearchFiles => {
-            let pat = intent::search_pattern(request).unwrap_or_else(|| "*".to_string());
+            let pat = intent::search_pattern(request)?;
             Some(Plan {
                 command: format!(
                     "find . -type f -name '{}' -not -path '*/node_modules/*' -not -path '*/.git/*'",
@@ -62,17 +134,48 @@ fn general_plan(raw: &RawScan, request: &str, intent: Intent) -> Option<Plan> {
             })
         }
         Intent::LargestFiles => {
-            if env::on_path("du") {
-                Some(Plan {
-                    command: "du -h --max-depth=3 . 2>/dev/null | sort -rh | head -20".to_string(),
-                    note: None,
-                })
-            } else {
-                Some(Plan {
-                    command: "find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -printf '%s %p\\n' | sort -rn | head -20".to_string(),
-                    note: None,
-                })
+            if !words.iter().all(|w| {
+                matches!(
+                    *w,
+                    "which"
+                        | "are"
+                        | "the"
+                        | "files"
+                        | "take"
+                        | "up"
+                        | "what"
+                        | "most"
+                        | "space"
+                        | "size"
+                        | "by"
+                        | "show"
+                        | "me"
+                        | "largest"
+                        | "biggest"
+                        | "list"
+                        | "in"
+                        | "this"
+                        | "directory"
+                        | "log"
+                ) || w.parse::<u32>().is_ok()
+            }) {
+                return None;
             }
+            let limit = words
+                .iter()
+                .find_map(|w| w.parse::<u32>().ok())
+                .unwrap_or(20);
+            let filter = if words.contains(&"log") {
+                " -name '*.log'"
+            } else {
+                ""
+            };
+            Some(Plan {
+                command: format!(
+                    "find . -type f{filter} -printf '%s %p\\n' | sort -rn | head -n {limit}"
+                ),
+                note: None,
+            })
         }
         Intent::GitStatus if raw.git.branch.is_some() && env::on_path("git") => Some(Plan {
             command: "git status".to_string(),
@@ -83,39 +186,29 @@ fn general_plan(raw: &RawScan, request: &str, intent: Intent) -> Option<Plan> {
             note: None,
         }),
         Intent::GitLog if raw.git.branch.is_some() && env::on_path("git") => Some(Plan {
-            command: "git log --oneline -10".to_string(),
+            command: history_command(&words, &raw.environment.cwd)?,
             note: None,
         }),
         Intent::InspectPort => {
-            let port = intent::port_number(request).unwrap_or(8080);
-            if env::on_path("ss") {
-                Some(Plan {
-                    command: format!("ss -tlnp | grep ':{port}'"),
-                    note: None,
-                })
+            let port = intent::port_number(request)?;
+            let command = if env::on_path("ss") {
+                format!("ss -lntup 'sport = :{port}'")
             } else if env::on_path("lsof") {
-                Some(Plan {
-                    command: format!("lsof -i :{port}"),
-                    note: None,
-                })
-            } else if env::on_path("netstat") {
-                Some(Plan {
-                    command: format!("netstat -tlnp 2>/dev/null | grep ':{port}'"),
-                    note: None,
-                })
+                format!("lsof -i :{port}")
             } else {
-                Some(Plan {
-                    command: format!(
-                        "grep -E ':{port}\\b' /proc/net/tcp /proc/net/tcp6 2>/dev/null || true"
-                    ),
-                    note: Some(
-                        "no ss/lsof/netstat installed; showing raw /proc/net entries".to_string(),
-                    ),
-                })
-            }
+                return None;
+            };
+            Some(Plan {
+                command,
+                note: None,
+            })
         }
         Intent::InspectProcess if env::on_path("ps") => Some(Plan {
-            command: "ps aux --sort=-%cpu | head -15".to_string(),
+            command: if count {
+                "ps -e -o pid= | wc -l".into()
+            } else {
+                "ps aux --sort=-%cpu | head -15".into()
+            },
             note: None,
         }),
         Intent::InstallPackage => {
@@ -149,6 +242,46 @@ fn general_plan(raw: &RawScan, request: &str, intent: Intent) -> Option<Plan> {
 }
 
 // ---------------------------------------------------------------------------
+fn history_command(words: &[&str], cwd: &Path) -> Option<String> {
+    let mut qty = None;
+    let mut file = None;
+    let mut iter = words.iter().copied();
+    while let Some(word) = iter.next() {
+        let number = word.parse::<usize>().ok().or_else(|| {
+            [
+                "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            ]
+            .iter()
+            .position(|n| *n == word)
+            .map(|n| n + 1)
+        });
+        if let Some(n) = number {
+            if n == 0 || qty.replace(n).is_some() {
+                return None;
+            }
+            continue;
+        }
+        match word {
+            "git" | "commit" | "commits" | "log" | "history" | "recent" | "last" | "latest"
+            | "the" | "briefly" | "show" | "me" | "list" | "please" | "oneline" => (),
+            "touching" | "affecting" | "for" => {
+                let path = iter.next()?;
+                if !cwd.join(path).is_file() || iter.next().is_some() {
+                    return None;
+                }
+                file = Some(path);
+            }
+            _ => return None,
+        }
+    }
+    let mut command = format!("git log --oneline -{}", qty.unwrap_or(10));
+    if let Some(f) = file {
+        command.push_str(" -- ");
+        command.push_str(&shell_quote(f));
+    }
+    Some(command)
+}
+
 // Directory navigation: resolve the destination from filesystem evidence.
 // A child process cannot change the parent shell's cwd, so the plan is a
 // plain `cd <verified path>`; with the opt-in zsh hook (`gico init-zsh`) the
@@ -229,7 +362,20 @@ const MARKER_FILES: &[(&str, &str)] = &[
 fn resolve_directory(request: &str, cwd: &Path) -> Result<std::path::PathBuf, &'static str> {
     let home = std::env::var_os("HOME").ok_or("home directory is unavailable")?;
     let home = std::path::PathBuf::from(home);
-    if let Some((_, destination)) = request.split_once(" to ") {
+    let destination = intent::navigation_destination(request).or_else(|| {
+        request
+            .split_once(" to ")
+            .map(|(_, destination)| destination)
+    });
+    if let Some(destination) = destination {
+        if intent::is_home_destination(destination) {
+            return home
+                .is_absolute()
+                .then(|| home.canonicalize().ok())
+                .flatten()
+                .filter(|path| path.is_dir())
+                .ok_or("home directory is unavailable");
+        }
         let destination = destination.trim().trim_matches(['\'', '"']);
         let explicit = destination.starts_with('/')
             || destination.starts_with('.')
@@ -247,10 +393,16 @@ fn resolve_directory(request: &str, cwd: &Path) -> Result<std::path::PathBuf, &'
                 .ok_or("could not find the requested directory");
         }
     }
-    let lower = request.to_lowercase();
-    let tokens: Vec<_> = lower
-        .split_whitespace()
-        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric() && c != '+'))
+    let lower = destination.unwrap_or(request).to_lowercase();
+    // “to where <name> is” identifies a named directory. A partial match
+    // (for example, a sibling project sharing two words) is insufficient.
+    let named = lower
+        .trim_end_matches(['.', '?', '!'])
+        .trim_end()
+        .strip_prefix("where ")
+        .and_then(|end| end.strip_suffix(" is"))
+        .map(|name| name.trim().trim_matches(['\'', '"']));
+    let tokens: Vec<_> = directory_words(&lower)
         .filter(|word| !word.is_empty() && !NAV_STOPWORDS.contains(word))
         .collect();
     if tokens.is_empty() {
@@ -288,20 +440,11 @@ fn resolve_directory(request: &str, cwd: &Path) -> Result<std::path::PathBuf, &'
             }
             let path = entry.path();
             let lower = name.to_lowercase();
-            let name_words = lower.split(|c: char| !c.is_alphanumeric() && c != '+');
-            let direct = tokens
-                .iter()
-                .filter(|token| name_words.clone().any(|word| word == **token))
-                .count();
-            if direct > 0 {
-                let markers = MARKER_FILES
-                    .iter()
-                    .filter(|(token, marker)| {
-                        tokens.contains(token)
-                            && (path.join(marker).is_file() || dir_has_child_marker(&path, marker))
-                    })
-                    .count();
-                let rank = (direct + 5 * markers, std::cmp::Reverse(depth));
+            let rank = match named {
+                Some(expected) => (lower == expected).then_some(0),
+                None => directory_rank(&path, &lower, &tokens),
+            };
+            if let Some(rank) = rank {
                 match best.as_ref() {
                     Some((current, _)) if rank == *current => tied = true,
                     Some((current, _)) if rank < *current => {}
@@ -321,8 +464,72 @@ fn resolve_directory(request: &str, cwd: &Path) -> Result<std::path::PathBuf, &'
             "directory evidence is ambiguous or the search limit was reached; specify a path",
         );
     }
-    best.map(|(_, path)| path)
-        .ok_or("could not find a directory matching the request")
+    let (_, path) = best.ok_or("could not find a directory matching the request")?;
+    Ok(cmake::relocated_source(&path)?.unwrap_or(path))
+}
+
+fn directory_words(name: &str) -> impl Iterator<Item = &str> + Clone {
+    name.split(|c: char| !c.is_alphanumeric() && c != '+')
+        .filter(|word| !word.is_empty())
+}
+
+fn canonical_language(word: &str) -> &str {
+    match word {
+        "cpp" => "c++",
+        _ => word,
+    }
+}
+
+fn directory_rank(path: &Path, name: &str, tokens: &[&str]) -> Option<usize> {
+    let words = directory_words(name).map(canonical_language);
+    let mut score = 0;
+    for &token in tokens {
+        let token = canonical_language(token);
+        if words.clone().any(|word| word == token) {
+            score += 3;
+            continue;
+        }
+        let language = MARKER_FILES.iter().any(|&(lang, _)| lang == token);
+        if language {
+            // A language can qualify a project name through its containing
+            // folder or a build file. A language-only request needs a named folder.
+            if tokens.len() == 1 {
+                return None;
+            }
+            let parent = path.parent()?.file_name()?.to_str()?.to_lowercase();
+            if directory_words(&parent)
+                .map(canonical_language)
+                .any(|word| word == token)
+                || MARKER_FILES
+                    .iter()
+                    .any(|&(lang, file)| lang == token && path.join(file).is_file())
+            {
+                continue;
+            }
+            return None;
+        }
+        let quality = words
+            .clone()
+            .filter_map(|word| {
+                if token.len() >= 3 && word.starts_with(token) {
+                    return Some(2);
+                }
+                (token.len() >= 4
+                    && word.len() >= 4
+                    && word.len().abs_diff(token.len()) <= 1
+                    && strsim::osa_distance(token, word) <= 1)
+                    .then_some(1)
+            })
+            .max()?;
+        score += quality;
+    }
+    if let [token] = tokens {
+        let marker = MARKER_FILES.iter().any(|(lang, file)| {
+            lang == token && (path.join(file).is_file() || dir_has_child_marker(path, file))
+        });
+        score += usize::from(marker);
+    }
+    Some(score)
 }
 
 fn dir_has_child_marker(dir: &Path, marker: &str) -> bool {
@@ -371,8 +578,8 @@ fn project_plan(raw: &RawScan, request: &str, intent: Intent) -> Option<Plan> {
     match project.build_system.as_deref() {
         Some("CMake") => cmake_plan(raw, request, intent),
         Some("Make") => make_plan(raw, intent),
-        Some("Cargo") => cargo_plan(raw, intent),
-        Some(pm @ ("npm" | "pnpm" | "yarn" | "bun")) => npm_plan(intent, pm),
+        Some("Cargo") => cargo_plan(raw, intent, request),
+        Some(pm @ ("npm" | "pnpm" | "yarn" | "bun")) => npm_plan(raw, intent, pm),
         Some("pip") | None if project.kind == "Python" => python_plan(project, intent),
         Some("Go modules") if env::on_path("go") => go_plan(intent),
         _ => fallback_cpp(raw, intent),
@@ -432,6 +639,33 @@ fn cmake_plan(raw: &RawScan, request: &str, intent: Intent) -> Option<Plan> {
             )
         })
         .collect();
+    let names = request
+        .split(|c: char| !c.is_alphanumeric() && !matches!(c, '-' | '_'))
+        .collect::<Vec<_>>();
+    let explicit: Vec<_> = eligible
+        .iter()
+        .copied()
+        .filter(|t| names.iter().any(|n| t.name.eq_ignore_ascii_case(n)))
+        .collect();
+    let eligible = if explicit.is_empty() {
+        eligible
+    } else {
+        explicit
+    };
+    if requested.is_some() && eligible.len() > 1 {
+        return Some(Plan {
+            command: String::new(),
+            note: Some(format!(
+                "Which {} target? {}",
+                requested?.as_str(),
+                eligible
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        });
+    }
     let mut eligible = eligible;
     eligible.sort_by_key(|target| target.kind != cmake::TargetKind::Cli);
     let build_tree_names: Vec<&str> = if requested.is_some() && intent == Intent::Run {
@@ -636,33 +870,63 @@ fn make_plan(raw: &RawScan, intent: Intent) -> Option<Plan> {
     }
 }
 
-fn cargo_plan(raw: &RawScan, intent: Intent) -> Option<Plan> {
-    let has_bin = raw
-        .entries
-        .iter()
-        .any(|e| e.path == "src/main.rs" || e.path.starts_with("src/bin/"));
+fn cargo_plan(raw: &RawScan, intent: Intent, request: &str) -> Option<Plan> {
     match intent {
         Intent::Build => Some(Plan {
-            command: "cargo build".to_string(),
+            command: "cargo build".into(),
             note: None,
         }),
         Intent::BuildAndRun | Intent::Run => {
-            if has_bin {
-                let cmd = if intent == Intent::BuildAndRun {
-                    "cargo build && cargo run"
-                } else {
-                    "cargo run"
-                };
-                Some(Plan {
-                    command: cmd.to_string(),
-                    note: None,
+            let bins = crate::context::cargo::binaries(raw);
+            let words = request
+                .split(|c: char| !c.is_alphanumeric() && !matches!(c, '-' | '_'))
+                .collect::<Vec<_>>();
+            let named: Vec<_> = bins
+                .iter()
+                .filter(|b| {
+                    words.iter().any(|w| {
+                        b.name.eq_ignore_ascii_case(w) || b.package.eq_ignore_ascii_case(w)
+                    })
                 })
+                .collect();
+            let bin = match named.as_slice() {
+                [one] => Some(*one),
+                [] if bins.len() == 1 => bins.first(),
+                _ => None,
+            };
+            let Some(bin) = bin else {
+                return Some(Plan {
+                    command: String::new(),
+                    note: Some(if bins.is_empty() {
+                        "No verified Cargo binary target.".into()
+                    } else {
+                        format!(
+                            "Which Cargo binary? {}",
+                            bins.iter()
+                                .map(|b| format!("{}/{}", b.package, b.name))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }),
+                });
+            };
+            let flags = if bins.len() == 1 && bin.manifest == Path::new("Cargo.toml") {
+                String::new()
             } else {
-                Some(Plan {
-                    command: "cargo build".to_string(),
-                    note: Some("library crate: no binary target, nothing to run".to_string()),
-                })
+                format!(
+                    " -p {} --bin {}",
+                    shell_quote(&bin.package),
+                    shell_quote(&bin.name)
+                )
+            };
+            let mut cmd = format!("cargo run{flags}");
+            if intent == Intent::BuildAndRun {
+                cmd = format!("cargo build{flags} && {cmd}");
             }
+            Some(Plan {
+                command: cmd,
+                note: None,
+            })
         }
         Intent::Test => Some(Plan {
             command: "cargo test".to_string(),
@@ -676,30 +940,32 @@ fn cargo_plan(raw: &RawScan, intent: Intent) -> Option<Plan> {
     }
 }
 
-fn npm_plan(intent: Intent, pm: &str) -> Option<Plan> {
-    match intent {
-        Intent::Build => Some(Plan {
-            command: format!("{pm} run build"),
-            note: None,
-        }),
-        Intent::BuildAndRun => Some(Plan {
-            command: format!("{pm} run build && {pm} start"),
-            note: None,
-        }),
-        Intent::Run => Some(Plan {
-            command: format!("{pm} start"),
-            note: None,
-        }),
-        Intent::Test => Some(Plan {
-            command: format!("{pm} test"),
-            note: None,
-        }),
-        Intent::Clean => Some(Plan {
-            command: format!("{pm} run clean"),
-            note: None,
-        }),
-        _ => None,
-    }
+fn npm_plan(raw: &RawScan, intent: Intent, pm: &str) -> Option<Plan> {
+    let pkg: serde_json::Value = serde_json::from_str(
+        &crate::context::fs::read_text(&raw.environment.cwd.join("package.json"), 65536).ok()?,
+    )
+    .ok()?;
+    let scripts = pkg.get("scripts").and_then(|s| s.as_object());
+    let has = |k: &str| scripts.is_some_and(|s| s.get(k).is_some_and(|v| v.is_string()));
+    let launcher = if has("start") {
+        Some(format!("{pm} start"))
+    } else if has("dev") {
+        Some(format!("{pm} run dev"))
+    } else {
+        None
+    };
+    let command = match intent {
+        Intent::Build if has("build") => format!("{pm} run build"),
+        Intent::Test if has("test") => format!("{pm} test"),
+        Intent::Clean if has("clean") => format!("{pm} run clean"),
+        Intent::Run => launcher?,
+        Intent::BuildAndRun if has("build") => format!("{pm} run build && {}", launcher?),
+        _ => return None,
+    };
+    Some(Plan {
+        command,
+        note: None,
+    })
 }
 
 fn python_plan(project: &crate::context::ProjectInfo, intent: Intent) -> Option<Plan> {

@@ -237,7 +237,35 @@ impl RawScan {
 /// (non-executable) response because there is nothing buildable here.
 /// Returns (title, detail) when applicable.
 pub fn informational_response(request: &str, scan: &RawScan) -> Option<(String, String)> {
-    if scan.project.is_some() {
+    let lower = request.to_lowercase();
+    if scan.project.is_some()
+        && (lower.contains("purpose")
+            || lower.contains("entrypoint")
+            || lower.contains("where does") && lower.contains("start"))
+    {
+        let evidence = registry::evidence(scan);
+        let facts = &evidence["observations"];
+        if lower.contains("purpose") {
+            if let Some(purpose) = evidence["preferences"]["purpose"]
+                .as_str()
+                .or(facts["purpose"].as_str())
+            {
+                return Some((purpose.to_owned(), String::new()));
+            }
+        } else if let Some(entries) = facts["entrypoints"].as_array() {
+            let paths = entries
+                .iter()
+                .take(8)
+                .filter_map(|e| e["path"].as_str())
+                .collect::<Vec<_>>();
+            if !paths.is_empty() {
+                return Some((paths.join(", "), "Project entrypoints".into()));
+            }
+        }
+    }
+    if scan.project.is_some()
+        || super::intent::classify(request, scan) == super::intent::Intent::InspectProcess
+    {
         return None;
     }
     let words = relevance::words(request);
@@ -298,3 +326,5 @@ fn language_from_request(request: &str, words: &[String]) -> Option<&'static str
     }
     None
 }
+pub mod cargo;
+pub mod registry;

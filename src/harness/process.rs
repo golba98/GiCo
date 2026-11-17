@@ -189,6 +189,18 @@ pub fn exec_shell(
     cancel: &CancelToken,
     timeout: Duration,
 ) -> io::Result<ExecOutcome> {
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+    let mut builder = Command::new(shell);
+    builder.arg("-c").arg(command);
+    exec_process(builder, cwd, cancel, timeout)
+}
+
+pub(super) fn exec_process(
+    mut command_builder: Command,
+    cwd: &Path,
+    cancel: &CancelToken,
+    timeout: Duration,
+) -> io::Result<ExecOutcome> {
     if cancel.is_cancelled() {
         return Ok(outcome(
             None,
@@ -200,13 +212,9 @@ pub fn exec_shell(
             (0, 0),
         ));
     }
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
     let foreground = Foreground::current();
     let handoff = foreground.is_some();
-    let mut command_builder = Command::new(shell);
     command_builder
-        .arg("-c")
-        .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())

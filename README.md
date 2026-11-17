@@ -12,28 +12,35 @@ $ gico "list files in this directory"
 
 ## Get started
 
-Install with the stable Rust toolchain and Cargo.
+Build from the checkout with the stable Rust toolchain. Put Cargo's bin directory
+on your shell's PATH.
 
 ```sh
-cargo install --locked --git https://github.com/golba98/GiCo.git --tag v0.1.2 --bin gico
+cargo install --locked --path . --bin gico --bin gico-bench
 gico --version
+gico models
 ```
 
-For requests that need a model, start [Ollama](https://ollama.com/) and download
-the model used in GiCo's benchmarks.
+Select an installed Ollama model once. The following example uses the small
+baseline model. If it is missing, install it with `ollama pull qwen2.5-coder:0.5b`.
 
 ```sh
-ollama pull qwen2.5-coder:0.5b
-export GICO_MODEL=qwen2.5-coder:0.5b
-gico "print a short greeting with printf"
+gico --model qwen2.5-coder:0.5b setup --zsh
+gico status
 ```
 
-Ollama defaults to http://127.0.0.1:11434. For a running llama.cpp server or
-another OpenAI-compatible endpoint, use:
+Open a new interactive Zsh terminal. GiCo warms the model quietly in the
+background and Ollama releases it after five idle minutes. The shell hook also
+applies approved directory changes to the calling shell. To remove the managed
+startup entry, run `gico setup --remove-zsh`. To keep directory navigation and
+disable startup warming, set `preload = false` in the configuration.
+
+Ollama defaults to `http://127.0.0.1:11434`. For a running llama.cpp server
+with structured output support, use its exact reported model identifier.
 
 ```sh
 gico --backend llamacpp --endpoint http://127.0.0.1:8080 models
-gico --backend llamacpp --endpoint http://127.0.0.1:8080 --model MODEL "print a short greeting with printf"
+gico --backend llamacpp --endpoint http://127.0.0.1:8080 --model MODEL setup
 ```
 
 ## Use GiCo
@@ -51,6 +58,7 @@ It supports `NO_COLOR` and wraps commands and notes to fit the terminal.
 ```sh
 gico "compile and run this C++ project"
 gico "find the graphical application built by this project and launch it"
+gico "what is the default profile described in README.md?"
 gico context --json
 gico verify "cargo test"
 gico --dry-run "build the project"
@@ -66,15 +74,23 @@ model = "qwen2.5-coder:0.5b"
 backend = "ollama"
 endpoint = "http://127.0.0.1:11434"
 budget_tokens = 700
+context_size = 4096
+max_tokens = 256
+temperature = 0.1
+preload = true
+idle_seconds = 300
 ```
 
-Directory changes can be applied in the calling Zsh session with the opt-in
-hook. Load it once in the current shell or add the line to `~/.zshrc`:
+From a project root, save an alias with `gico alias "pixel tools"`. You can
+then refer to that project from another directory. GiCo keeps generated
+observations in `$XDG_DATA_HOME/gico` (normally `~/.local/share/gico`).
+Each project's `context.json` records the metadata behind its targets and
+recipes. Its separate `preferences.json` holds your aliases, purpose and file
+roles. Refreshing observations preserves those preferences.
 
-```sh
-eval "$(gico init-zsh)"
-gico "change to my Rust development directory"
-```
+For a question that names a single discovered project document, source file or
+manifest, GiCo can read a short excerpt before answering. It withholds excerpts
+that appear to contain credentials and asks for the relevant passage instead.
 
 ## How it works
 
@@ -111,11 +127,19 @@ cargo run --locked --release --bin gico-bench -- \
   --model qwen2.5-coder:0.5b --suite legacy
 ```
 
-The legacy suite has 107 cases. In one matched Fedora 45 run, the original
-implementation passed 60 and GiCo 0.1.1 passed 61. GiCo 0.1.1 passed 11 of
-12 additional cases in the holdout suite. Use `--suite holdout` for those
-cases and pass `--exec` in an isolated fixture environment to measure actual
-command execution.
+The legacy suite has 107 cases and the published holdout suite has 12.
+Use `--suite all --modes full --exec` for both. Some legacy cases still use
+command-pattern checks. For behavioral evaluations, supply a fixture manifest
+and a new output filename. These evaluations require Linux user namespaces,
+Bubblewrap, Python 3 and pexpect.
+
+```sh
+gico-bench --model qwen2.5-coder:0.5b --manifest cases.json --output results.jsonl
+```
+
+The behavioral evaluator records the live proposal and inference trace, then
+replays the proposal through an isolated approval PTY and checks fixture output
+or state. It creates an independent fixture for each case.
 
 ## License
 

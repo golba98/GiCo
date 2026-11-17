@@ -619,3 +619,72 @@ pub fn target_kinds(project_root: &Path) -> Vec<TargetInfo> {
         })
         .collect()
 }
+
+/// Match a leftover build-only directory to a sibling source tree after a rename.
+/// Both the former and the current source location must be recorded by CMake.
+pub fn relocated_source(old: &Path) -> Result<Option<PathBuf>, &'static str> {
+    let Ok(entries) = std::fs::read_dir(old) else {
+        return Ok(None);
+    };
+    let mut has_build = false;
+    for (index, entry) in entries.take(33).enumerate() {
+        if index == 32 {
+            return Ok(None);
+        }
+        let Ok(entry) = entry else { return Ok(None) };
+        if !entry.file_type().is_ok_and(|t| t.is_dir())
+            || !super::fs::is_build_dir_name(&entry.file_name().to_string_lossy())
+        {
+            return Ok(None);
+        }
+        has_build = true;
+    }
+    if !has_build {
+        return Ok(None);
+    }
+    let Some(siblings) = old.parent().and_then(|p| p.read_dir().ok()) else {
+        return Ok(None);
+    };
+    let mut relocated = None;
+    for (index, entry) in siblings.take(129).enumerate() {
+        if index == 128 {
+            return Ok(None);
+        }
+        let Ok(entry) = entry else { continue };
+        let source = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir())
+            || !source
+                .join("CMakeLists.txt")
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_file())
+        {
+            continue;
+        }
+        let Ok(children) = source.read_dir() else {
+            continue;
+        };
+        let mut former = false;
+        let mut current = false;
+        for child in children.take(96).flatten() {
+            if !child.file_type().is_ok_and(|t| t.is_dir())
+                || !child
+                    .path()
+                    .join("CMakeCache.txt")
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.is_file())
+            {
+                continue;
+            }
+            let tree = inspect_build_tree(&source, &child.file_name().to_string_lossy());
+            former |= tree
+                .cache_home
+                .as_deref()
+                .is_some_and(|p| Path::new(p) == old);
+            current |= tree.valid;
+        }
+        if former && current && relocated.replace(source).is_some() {
+            return Err("Which source project do you mean? Multiple projects have caches for that directory.");
+        }
+    }
+    Ok(relocated)
+}
