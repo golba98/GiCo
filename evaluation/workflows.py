@@ -369,8 +369,10 @@ def one(case, binary, model, structured):
             text = decision.get("text", text)
         trace = proc.stderr
         calls = trace.count("op generate: provider response")
-        if not calls:
+        generation_attempts = trace.count("op generate: candidate generation")
+        if not structured:
             calls = trace.count("op generate: model call")
+            generation_attempts = calls
         row = {
             "id": case["id"],
             "family": case["family"],
@@ -394,7 +396,7 @@ def one(case, binary, model, structured):
             for line in trace.splitlines()
         )
         row["repair_attempts"] = (
-            max(0, trace.count("op generate: model call") - 1) + row["schema_failures"]
+            max(0, generation_attempts - 1) + row["schema_failures"]
         )
         blocked = (
             "• blocked:" in text
@@ -513,7 +515,7 @@ def one(case, binary, model, structured):
             row["ok"]
             and "invalid schema" not in trace
             and trace.count("op verify:") <= 1
-            and trace.count("op generate: model call") <= 1
+            and generation_attempts <= 1
         )
         return row
 

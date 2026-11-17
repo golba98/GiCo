@@ -48,7 +48,11 @@ pub(super) fn preview(
     };
     let out = String::from_utf8_lossy(&output.stdout);
     let trace = String::from_utf8_lossy(&output.stderr);
-    let calls = trace.matches("op generate: model call").count();
+    let calls = if trace.contains("op generate: provider response") {
+        trace.matches("op generate: provider response").count()
+    } else {
+        trace.matches("op generate: model call").count()
+    };
     let candidate = case.fixed.or_else(|| {
         trace
             .lines()

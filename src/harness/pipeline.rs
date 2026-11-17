@@ -431,7 +431,7 @@ pub fn generate_candidate(
                 } else {
                     harness.record_ms(
                         kind,
-                        "model call",
+                        "candidate generation",
                         OpOutcome::Ok,
                         start.elapsed().as_millis(),
                     );
@@ -443,7 +443,12 @@ pub fn generate_candidate(
             Err(error) => (OpOutcome::Failed(error.clone()), Preparation::Failed(error)),
         }
     };
-    harness.record_ms(kind, "model call", outcome, start.elapsed().as_millis());
+    harness.record_ms(
+        kind,
+        "candidate generation",
+        outcome,
+        start.elapsed().as_millis(),
+    );
     result
 }
 

@@ -118,6 +118,7 @@ fn question_about_named_document_includes_scoped_evidence_on_the_first_round() {
         "--endpoint",
         &endpoint,
         "--proposal-json",
+        "--verbose",
         "What is the calibration label in README.md?",
     ];
     let ask = || {
@@ -140,4 +141,7 @@ fn question_about_named_document_includes_scoped_evidence_on_the_first_round() {
         "clarify"
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("withheld-value"));
+    let trace = String::from_utf8_lossy(&output.stderr);
+    assert!(trace.contains("op inspect: read (Blocked"));
+    assert!(!trace.contains("op generate: provider response"));
 }
