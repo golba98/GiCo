@@ -31,6 +31,8 @@ pub struct ExecOutcome {
     pub killed: bool,
     pub started: bool,
     pub cancelled: bool,
+    #[serde(default)]
+    pub readiness: Option<(bool, String)>,
 }
 
 impl ExecOutcome {
@@ -192,7 +194,7 @@ pub fn exec_shell(
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
     let mut builder = Command::new(shell);
     builder.arg("-c").arg(command);
-    exec_process(builder, cwd, cancel, timeout)
+    exec_process(builder, cwd, cancel, timeout, None)
 }
 
 pub(super) fn exec_process(
@@ -200,6 +202,7 @@ pub(super) fn exec_process(
     cwd: &Path,
     cancel: &CancelToken,
     timeout: Duration,
+    readiness: Option<super::readiness::Readiness>,
 ) -> io::Result<ExecOutcome> {
     if cancel.is_cancelled() {
         return Ok(outcome(
@@ -238,6 +241,7 @@ pub(super) fn exec_process(
     let mut stderr = Capture::new(child.stderr.take().expect("piped stderr"));
     let start = Instant::now();
     let mut reaped = false;
+    let mut observer = readiness.map(super::readiness::Observer::new);
     let result = (|| {
         stdout.set_nonblocking()?;
         stderr.set_nonblocking()?;
@@ -254,6 +258,9 @@ pub(super) fn exec_process(
                 reaped = true;
                 break (status, false, false);
             }
+            if let Some(observer) = observer.as_mut() {
+                observer.check(pgid);
+            }
             let progressed = stdout.drain(io::stdout())? | stderr.drain(io::stderr())?;
             if !progressed {
                 std::thread::sleep(Duration::from_millis(10));
@@ -267,7 +274,7 @@ pub(super) fn exec_process(
                 break;
             }
         }
-        Ok(outcome(
+        let mut outcome = outcome(
             Some(status),
             cancelled,
             timed_out,
@@ -275,7 +282,9 @@ pub(super) fn exec_process(
             stdout.preview(),
             stderr.preview(),
             (stdout.bytes.omitted_bytes(), stderr.bytes.omitted_bytes()),
-        ))
+        );
+        outcome.readiness = observer.map(super::readiness::Observer::finish);
+        Ok(outcome)
     })();
     if !reaped {
         let _ = group::signal_process_group_id(pgid, libc::SIGKILL);
@@ -308,5 +317,6 @@ fn outcome(
         killed: (started && (cancelled || timed_out)) || signal.is_some(),
         started,
         cancelled,
+        readiness: None,
     }
 }

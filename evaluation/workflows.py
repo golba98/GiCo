@@ -122,10 +122,15 @@ def setup(case, root):
     return token
 
 
-def limits():
-    resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (8 << 20, 8 << 20))
-    resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+def limits(toolchain=False):
+    cpu = 30 if toolchain else 5
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+    size = (64 if toolchain else 8) << 20
+    resource.setrlimit(resource.RLIMIT_FSIZE, (size, size))
+    if toolchain:
+        os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:2])
+    cap = (32 if toolchain else 2) << 30
+    resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
 
 
 def namespace(root, cwd, home):
@@ -190,6 +195,40 @@ def approved(
     # Replay the live proposal at GiCo's actual approval screen inside the fixture.
     # Only the second model response is injected. Verification and dispatch are real.
     args = namespace(root, cwd, home)
+    # Explicit read-only SDK roots allow native build/run fixtures in the same
+    # network-isolated sandbox. State and caches remain under the fixture HOME.
+    toolchains = json.loads(os.environ.get("GICO_EVAL_TOOLCHAINS", "{}"))
+    family = case.get("sdk")
+    sdk = toolchains.get(family)
+    if sdk:
+        if family not in {"cargo", "go", "dotnet", "java"} or not Path(sdk).is_absolute():
+            raise ValueError("invalid fixture toolchain")
+        bin_dir = "/fixture-sdk" if family == "dotnet" else "/fixture-sdk/bin"
+        args.extend(["--ro-bind", sdk, "/fixture-sdk", "--setenv", "PATH",
+                     bin_dir + ":/usr/bin:/bin"])
+        if family == "dotnet":
+            (home / "empty-feed").mkdir(exist_ok=True)
+            config = write(home, "offline-nuget.config",
+                           "<configuration><packageSources><clear /></packageSources></configuration>")
+            passwd = write(home, "passwd", f"fixture:x:{os.getuid()}:{os.getgid()}:Fixture:{home}:/bin/sh\n")
+            group = write(home, "group", f"fixture:x:{os.getgid()}:\n")
+            args.extend(["--ro-bind", str(passwd), "/etc/passwd",
+                         "--ro-bind", str(group), "/etc/group",
+                         "--setenv", "RestoreConfigFile", str(config),
+                         "--setenv", "RestoreSources", str(home / "empty-feed"),
+                         "--setenv", "NuGetAudit", "false",
+                         "--setenv", "NUGET_PACKAGES", str(home / "packages"),
+                         "--setenv", "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1"])
+        for key, value in {
+            "CARGO_NET_OFFLINE": "true", "CARGO_TARGET_DIR": str(home / "target"),
+            "GOTOOLCHAIN": "local", "GOCACHE": str(home / "go-cache"),
+            "DOTNET_CLI_HOME": str(home), "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+            "DOTNET_NOLOGO": "1", "DOTNET_GCHeapHardLimit": "0x20000000",
+            "DOTNET_PROCESSOR_COUNT": "2", "DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE": "true",
+            "MSBUILDDISABLENODEREUSE": "1",
+            "ArtifactsPath": str(home / "dotnet-output"), "UseArtifactsOutput": "true",
+        }.items():
+            args.extend(["--setenv", key, value])
     with tempfile.TemporaryDirectory(dir=home) as handoff:
         args.extend(
             [
@@ -260,9 +299,9 @@ s.server_close(); os.execv('/gico-fixture',['/gico-fixture',*sys.argv[1:]])
             encoding="utf-8",
             codec_errors="replace",
             dimensions=(32, 2000),
-            timeout=7,
+            timeout=40 if sdk else 7,
             echo=False,
-            preexec_fn=limits,
+            preexec_fn=lambda: limits(bool(sdk) or case["family"] == "typescript"),
         )
         try:
             p.expect_exact("↵ run · r refine · e edit · c cancel")
@@ -276,7 +315,7 @@ s.server_close(); os.execv('/gico-fixture',['/gico-fixture',*sys.argv[1:]])
             idx = p.expect(
                 [
                     pexpect.EOF,
-                    "previous run exited",
+                    r"[Pp]revious run exited",
                     "input path changed",
                     "execution failed:",
                     pexpect.TIMEOUT,
@@ -312,7 +351,7 @@ s.server_close(); os.execv('/gico-fixture',['/gico-fixture',*sys.argv[1:]])
                 trace = log.read_text(errors="replace")[-16384:]
                 audit["trace"] = trace
                 audit["approved"] = any(line.startswith("op approve:") and " (Ok," in line for line in trace.splitlines())
-                audit["dispatched"] = any(line.startswith(("op execute:", "op navigate:")) and (" (Ok," in line or 'Failed("exited with code ' in line) for line in trace.splitlines())
+                audit["dispatched"] = any(line.startswith(("op execute:", "op navigate:")) and (" (Ok," in line or 'Failed("exited with code ' in line or 'Interrupted("requested application readiness unverified")' in line or 'Interrupted("process started, window unverified")' in line) for line in trace.splitlines())
                 if audit["dispatched"]:
                     failed = re.search(r'op execute: .*Failed\("exited with code (\d+)"\)', trace)
                     audit["child_exit"] = int(failed[1]) if failed else 0
@@ -359,6 +398,8 @@ def one(case, binary, model, structured):
         home = Path(tmp)
         root = inside(home, Path("Development") / case.get("project", "Amber Loom"))
         root.mkdir(parents=True)
+        for directory in case.get("home_dirs", []):
+            inside(home, directory).mkdir(parents=True, exist_ok=True)
         token = setup(case, root)
         cwd = inside(root, case.get("cwd", "."))
         cwd.mkdir(exist_ok=True, parents=True)

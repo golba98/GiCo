@@ -104,8 +104,15 @@ that appear to contain credentials and asks for the relevant passage instead.
   working directory. Approved commands support cancellation and timeouts.
 
 Shell verification is heuristic. Approved commands run with the current
-user's permissions, so review them before pressing Enter. GUI detection
-uses available CMake evidence and requires a display server to launch.
+user's permissions, so review them before pressing Enter. GiCo resolves supported launches from project manifests, source entrypoints,
+and documented recipes. It asks for a choice when there are several matching
+targets. Desktop launches require a display server. After a failed command,
+GiCo can refresh its evidence and present a correction for a new approval.
+
+For example, try `gico "show me the GUI in this Rust build"` from a Cargo
+workspace. With the Zsh hook, `gico "go back where I was"` uses the shell's
+previous directory, including manual directory changes. Add absolute paths to
+`workspace_roots` in the GiCo configuration to include other workspaces.
 
 ## Development
 

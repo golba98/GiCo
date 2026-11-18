@@ -690,3 +690,67 @@ fn pty_rejects_a_program_replaced_in_place_after_preview() {
     assert_eq!(s.wait(), Some(0));
     assert!(!tmp.path().join("surprise").exists());
 }
+
+#[test]
+fn unchanged_failure_cannot_be_executed_with_another_enter() {
+    let dir = fixture_dir();
+    let mut session = spawn_gico(dir.path(), "echo repeated >> attempts; exit 7");
+    assert!(session
+        .read_until("↵ run", Duration::from_secs(5))
+        .contains("↵ run"));
+    session.send("\r");
+    assert!(session
+        .read_until("previous run failed", Duration::from_secs(5))
+        .contains("previous run failed"));
+    session.send("\r");
+    assert!(session
+        .read_until("Enter cannot run", Duration::from_secs(5))
+        .contains("Enter cannot run"));
+    session.send("c");
+    assert_eq!(session.wait(), Some(7));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("attempts")).unwrap(),
+        "repeated\n"
+    );
+}
+
+#[test]
+fn server_reports_a_listener_while_the_approved_child_is_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"relay","scripts":{"start":"node server.js"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("server.js"),
+        "require('http').createServer((req,res)=>res.end('ok')).listen(0,'127.0.0.1');",
+    )
+    .unwrap();
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+        || std::process::Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_err()
+    {
+        return;
+    }
+    let mut command = CommandBuilder::new(gico_bin());
+    command.args(["--no-cache", "start the server here"]);
+    command.env("NO_COLOR", "1");
+    command.env_remove("GICO_MOCK_COMMAND");
+    command.cwd(dir.path());
+    let mut session = spawn_pty(command);
+    assert!(session
+        .read_until("↵ run", Duration::from_secs(6))
+        .contains("↵ run"));
+    session.send("\r");
+    assert!(session
+        .read_until("Listening on local port", Duration::from_secs(8))
+        .contains("Listening on local port"));
+    session.send("\x03");
+    assert_eq!(session.wait(), Some(130));
+}

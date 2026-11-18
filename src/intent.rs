@@ -161,6 +161,9 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
     {
         return Intent::Explain;
     }
+    if crate::context::registry::previous_directory(request) {
+        return Intent::NavigateDir;
+    }
     let destination = navigation_destination(request);
     if destination.is_some_and(is_home_destination)
         || ["change directory to ", "change the directory to "]
@@ -172,21 +175,30 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
     if destination.is_some() {
         return Intent::NavigateDir;
     }
-    // Build/run/test/clean (existing semantics, phrase-tolerant).
-    let build = has(&[
-        "compile",
-        "build",
-        "make ",
-        "rebuild",
-        "link the",
-        "fix the build",
-    ]);
-    let run = r
-        .split_whitespace()
-        .any(|w| matches!(w, "run" | "execute" | "launch" | "start"))
-        || has(&["bring up", "open the graphical"])
-        || r.split_whitespace()
-            .next()
+    let words: Vec<_> = r
+        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .filter(|word| !word.is_empty())
+        .collect();
+    let build = words.iter().enumerate().any(|(i, word)| {
+        matches!(*word, "compile" | "rebuild")
+            || *word == "build"
+                && (i == 0
+                    || matches!(
+                        words.get(i.wrapping_sub(1)),
+                        Some(&("please" | "then" | "and" | "to"))
+                    )
+                    || words.get(i + 1) == Some(&"then"))
+    }) || has(&["fix the build", "link the", "make this", "make the project"]);
+    let run = words
+        .iter()
+        .any(|w| matches!(*w, "run" | "execute" | "launch" | "start" | "open"))
+        || wants_gui(request)
+            && words
+                .iter()
+                .any(|w| matches!(*w, "see" | "show" | "display"))
+        || has(&["bring up"])
+        || words
+            .first()
             .is_some_and(|w| w.len().abs_diff(6) <= 1 && strsim::osa_distance(w, "launch") <= 1);
     if r.starts_with("where does ") || r.starts_with("what is this project") {
         return Intent::Explain;
@@ -206,6 +218,9 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
     }
     if build {
         return Intent::Build;
+    }
+    if run && !has(&["git ", " kill ", "kill ", "restart ", "start a new shell"]) {
+        return Intent::Run;
     }
     // Git.
     let in_repo = scan.git.branch.is_some();
@@ -246,7 +261,7 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
     if has(&["disk", "space left", "storage"]) {
         return Intent::DiskUsage;
     }
-    if has(&["memory", "ram", "mem "]) {
+    if words.iter().any(|w| matches!(*w, "memory" | "ram" | "mem")) {
         return Intent::MemoryInfo;
     }
     // Directory navigation.
@@ -393,6 +408,7 @@ pub fn wants_gui(request: &str) -> bool {
         .any(|word| matches!(word, "graphical" | "gui" | "windowed"))
         || r.contains("desktop app")
         || r.contains("the app window")
+        || r.contains("open the app i built")
 }
 
 /// True when the request asks for a background service/daemon.

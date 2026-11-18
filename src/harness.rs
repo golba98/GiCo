@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 pub mod pipeline;
 mod process;
+mod readiness;
 pub use process::{exec_shell, ExecOutcome, InterruptGuard};
 
 use serde::{Deserialize, Serialize};

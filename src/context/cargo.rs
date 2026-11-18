@@ -1,7 +1,7 @@
-//! Read Cargo manifest declarations and conventional binary paths without running Cargo.
+//! Read workspace manifests and their declared entrypoints without executing project code.
 use super::{fs, RawScan};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Serialize)]
 pub struct Binary {
@@ -9,99 +9,175 @@ pub struct Binary {
     pub name: String,
     pub path: PathBuf,
     pub manifest: PathBuf,
+    pub example: bool,
+    pub required_features: Vec<String>,
+    pub default_run: bool,
 }
 
-fn member(pattern: &str, dir: &Path) -> bool {
-    let want: Vec<_> = Path::new(pattern).components().collect();
-    let have: Vec<_> = dir.components().collect();
-    want.len() == have.len()
-        && want
-            .iter()
-            .zip(have)
-            .all(|(a, b)| a.as_os_str() == "*" || a == &b)
+pub(crate) fn manifest(path: &Path) -> Option<toml::Value> {
+    toml::from_str(&fs::read_text(path, 131_072).ok()?).ok()
+}
+
+fn strings(value: &toml::Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn members(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    let mut paths = vec![root.to_path_buf()];
+    for part in Path::new(pattern).components() {
+        let Component::Normal(part) = part else {
+            return Vec::new();
+        };
+        let part = part.to_string_lossy();
+        if let Some((prefix, suffix)) = part.split_once('*') {
+            paths = paths
+                .iter()
+                .flat_map(|p| p.read_dir().into_iter().flatten().take(128).flatten())
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .filter(|e| {
+                    e.file_name().to_str().is_some_and(|n| {
+                        !fs::is_sensitive(n, true)
+                            && !n.starts_with('.')
+                            && n.starts_with(prefix)
+                            && n.ends_with(suffix)
+                    })
+                })
+                .map(|e| e.path())
+                .take(64)
+                .collect();
+        } else {
+            for p in &mut paths {
+                p.push(part.as_ref());
+            }
+        }
+    }
+    paths.retain(|p| fs::inside(root, p));
+    paths
 }
 
 pub fn binaries(raw: &RawScan) -> Vec<Binary> {
     let root = &raw.environment.cwd;
-    let parse = |p: &Path| toml::from_str::<toml::Value>(&fs::read_text(p, 131072).ok()?).ok();
-    let Some(workspace) = parse(&root.join("Cargo.toml")) else {
+    let Some(top) = manifest(&root.join("Cargo.toml")) else {
         return vec![];
     };
-    let members = workspace
-        .get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(|v| v.as_array());
+    let mut dirs = vec![root.clone()];
+    if let Some(ws) = top.get("workspace") {
+        let exclusions: Vec<_> = ws
+            .get("exclude")
+            .map(strings)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|p| members(root, p))
+            .collect();
+        dirs.extend(
+            ws.get("members")
+                .map(strings)
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|p| members(root, p))
+                .filter(|p| !exclusions.contains(p))
+                .take(64),
+        );
+    }
+    dirs.sort();
+    dirs.dedup();
     let mut bins = vec![];
-    for e in raw
-        .entries
-        .iter()
-        .filter(|e| e.name == "Cargo.toml")
-        .take(24)
-    {
-        let manifest = Path::new(&e.path);
-        let parent = manifest.parent().unwrap_or(Path::new(""));
-        if !parent.as_os_str().is_empty()
-            && !members.is_some_and(|m| {
-                m.iter()
-                    .filter_map(|v| v.as_str())
-                    .any(|p| member(p, parent))
-            })
-        {
-            continue;
-        }
-        let Some(doc) = parse(&root.join(manifest)) else {
+    for dir in dirs {
+        let path = dir.join("Cargo.toml");
+        let Some(doc) = manifest(&path) else { continue };
+        let Some(pkg) = doc.get("package") else {
             continue;
         };
-        let Some(package) = doc
-            .get("package")
-            .and_then(|p| p.get("name"))
-            .and_then(|v| v.as_str())
-        else {
+        let Some(package) = pkg.get("name").and_then(toml::Value::as_str) else {
             continue;
         };
-        let mut add = |name: &str, path: PathBuf| {
-            if !name.starts_with('-')
-                && name
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
-                && raw
-                    .entries
-                    .iter()
-                    .any(|e| Path::new(&e.path) == path && e.kind == fs::FileKind::Source)
-                && !bins
-                    .iter()
-                    .any(|b: &Binary| b.package == package && b.name == name)
-            {
+        let default = pkg.get("default-run").and_then(toml::Value::as_str);
+        let mut add =
+            |name: &str, source: PathBuf, example: bool, required_features: Vec<String>| {
+                let Ok(rel) = source.strip_prefix(root) else {
+                    return;
+                };
+                if name.starts_with('-')
+                    || name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+                    || !source.is_file()
+                    || !fs::inside(root, &source)
+                    || bins.iter().any(|b: &Binary| {
+                        b.package == package && b.name == name && b.example == example
+                    })
+                {
+                    return;
+                }
                 bins.push(Binary {
                     package: package.into(),
                     name: name.into(),
-                    path,
-                    manifest: manifest.into(),
+                    path: rel.into(),
+                    manifest: path.strip_prefix(root).expect("member under root").into(),
+                    example,
+                    required_features,
+                    default_run: !example && default == Some(name),
                 });
+            };
+        for (key, example, folder, auto) in [
+            ("bin", false, "src/bin", "autobins"),
+            ("example", true, "examples", "autoexamples"),
+        ] {
+            for entry in doc
+                .get(key)
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(name) = entry.get("name").and_then(toml::Value::as_str) else {
+                    continue;
+                };
+                let source = entry
+                    .get("path")
+                    .and_then(toml::Value::as_str)
+                    .map(|p| dir.join(p))
+                    .unwrap_or_else(|| dir.join(folder).join(format!("{name}.rs")));
+                add(
+                    name,
+                    source,
+                    example,
+                    entry
+                        .get("required-features")
+                        .map(strings)
+                        .unwrap_or_default(),
+                );
             }
-        };
-        if let Some(items) = doc.get("bin").and_then(|v| v.as_array()) {
-            for item in items {
-                if let (Some(name), Some(path)) = (
-                    item.get("name").and_then(|v| v.as_str()),
-                    item.get("path").and_then(|v| v.as_str()),
-                ) {
-                    add(name, parent.join(path));
-                }
+            if pkg.get(auto).and_then(toml::Value::as_bool) == Some(false) {
+                continue;
             }
-        }
-        if doc["package"].get("autobins").and_then(|v| v.as_bool()) != Some(false) {
-            add(package, parent.join("src/main.rs"));
-            let bin = parent.join("src/bin");
-            for e in &raw.entries {
-                let path = Path::new(&e.path);
-                if path.parent() == Some(&bin) && path.extension().is_some_and(|e| e == "rs") {
-                    if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                        add(name, path.into());
+            if !example {
+                add(package, dir.join("src/main.rs"), false, Vec::new());
+            }
+            for item in dir
+                .join(folder)
+                .read_dir()
+                .into_iter()
+                .flatten()
+                .take(64)
+                .flatten()
+            {
+                let path = item.path();
+                if path.extension().is_some_and(|e| e == "rs") {
+                    if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
+                        add(name, path.clone(), example, Vec::new());
                     }
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    add(name, path.join("main.rs"), example, Vec::new());
                 }
             }
         }
     }
+    bins.sort_by(|a, b| (&a.package, &a.name, a.example).cmp(&(&b.package, &b.name, b.example)));
     bins
 }
