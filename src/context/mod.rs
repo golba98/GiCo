@@ -268,6 +268,18 @@ pub fn informational_response(request: &str, scan: &RawScan) -> Option<(String, 
     {
         return None;
     }
+    if crate::query::Query::parse(request).is_some()
+        || !matches!(
+            crate::intent::classify(request, scan),
+            crate::intent::Intent::Build
+                | crate::intent::Intent::BuildAndRun
+                | crate::intent::Intent::Test
+                | crate::intent::Intent::Run
+                | crate::intent::Intent::Clean
+        )
+    {
+        return None;
+    }
     let words = relevance::words(request);
     let intent = [
         "compile", "build", "run", "test", "start", "make", "link", "execute", "launch",

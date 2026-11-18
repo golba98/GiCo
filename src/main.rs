@@ -324,15 +324,14 @@ fn main() -> ExitCode {
                 }
             }
             match client.backend {
-                Backend::Ollama => match client.resident() {
-                    Ok(value) => println!(
-                        "runner: {}",
-                        if value {
-                            "resident"
-                        } else {
-                            "unloaded or different context size"
-                        }
+                Backend::Ollama => match client.resident_context() {
+                    Ok(Some(n)) if n == cfg.context_size as u64 => println!("runner: resident"),
+                    Ok(_) if gico::lifecycle::loading(&cfg) => println!("runner: loading"),
+                    Ok(Some(n)) => println!(
+                        "runner: resident with {n} context tokens (configured {})",
+                        cfg.context_size
                     ),
+                    Ok(None) => println!("runner: installed, unloaded"),
                     Err(e) => return io_error("runner status", e),
                 },
                 Backend::OpenAiCompatible => {
@@ -464,12 +463,21 @@ impl Generator<'_> {
         if let Ok(mock) = std::env::var("GICO_MOCK_COMMAND") {
             return Ok(gico::discovery::Reply::Command(mock));
         }
-        if !self.loading_checked.replace(true)
-            && self.client.backend == Backend::Ollama
-            && std::io::stderr().is_terminal()
+        let cold = std::io::stderr().is_terminal()
             && std::env::var_os("GICO_TERMINAL").is_some()
-            && self.client.resident().is_ok_and(|resident| !resident)
-        {
+            && !self.loading_checked.replace(true)
+            && self.client.backend == Backend::Ollama
+            && self.client.resident().is_ok_and(|v| !v);
+        let _loading = cold
+            .then(|| {
+                gico::lifecycle::loading_marker(
+                    &self.client.endpoint,
+                    &self.client.model,
+                    self.client.context_size,
+                )
+            })
+            .flatten();
+        if cold && std::io::stderr().is_terminal() && std::env::var_os("GICO_TERMINAL").is_some() {
             eprintln!(
                 "  gico › loading {}",
                 ui::safe_multiline(&self.client.model)
@@ -991,6 +999,7 @@ fn interact_request(
                 if line.is_empty() {
                     continue;
                 }
+                harness.begin_refinement();
                 let feedback = match &last_failure {
                     Some(failure) => format!("{line}. Previous attempt: {failure}"),
                     None => line.to_owned(),

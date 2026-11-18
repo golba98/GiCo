@@ -23,6 +23,18 @@ pub struct Plan {
 
 /// Build a deterministic plan for the request in the scanned directory.
 pub fn plan(raw: &RawScan, request: &str) -> Option<Plan> {
+    if let Some(query) = crate::query::Query::parse(request) {
+        return Some(match query.render(&raw.environment.cwd) {
+            Ok(command) => Plan {
+                command,
+                note: None,
+            },
+            Err(reason) => Plan {
+                command: String::new(),
+                note: Some(reason),
+            },
+        });
+    }
     let intent = intent::classify(request, raw);
     if matches!(intent, Intent::Run | Intent::BuildAndRun)
         && requested_target_kind(request).is_some()
@@ -245,6 +257,8 @@ fn general_plan(raw: &RawScan, request: &str, intent: Intent) -> Option<Plan> {
 fn history_command(words: &[&str], cwd: &Path) -> Option<String> {
     let mut qty = None;
     let mut file = None;
+    let mut subjects = false;
+    let mut singleton = false;
     let mut iter = words.iter().copied();
     while let Some(word) = iter.next() {
         let number = word.parse::<usize>().ok().or_else(|| {
@@ -262,11 +276,14 @@ fn history_command(words: &[&str], cwd: &Path) -> Option<String> {
             continue;
         }
         match word {
-            "git" | "commit" | "commits" | "log" | "history" | "recent" | "last" | "latest"
-            | "the" | "briefly" | "show" | "me" | "list" | "please" | "oneline" => (),
-            "touching" | "affecting" | "for" => {
-                let path = iter.next()?;
-                if !cwd.join(path).is_file() || iter.next().is_some() {
+            "commit" => singleton = true,
+            "subjects" | "subject" => subjects = true,
+            "newest" | "most" | "only" | "that" | "give" | "display" | "first" | "me," => (),
+            "git" | "commits" | "log" | "history" | "recent" | "last" | "latest" | "the"
+            | "briefly" | "show" | "me" | "list" | "please" | "oneline" => (),
+            "touching" | "affecting" | "changed" | "for" => {
+                let path = iter.next()?.trim_end_matches(',');
+                if !cwd.join(path).is_file() || file.is_some() {
                     return None;
                 }
                 file = Some(path);
@@ -274,7 +291,11 @@ fn history_command(words: &[&str], cwd: &Path) -> Option<String> {
             _ => return None,
         }
     }
-    let mut command = format!("git log --oneline -{}", qty.unwrap_or(10));
+    let format = if subjects { "--format=%s" } else { "--oneline" };
+    let mut command = format!(
+        "git log {format} -{}",
+        qty.unwrap_or(if singleton { 1 } else { 10 })
+    );
     if let Some(f) = file {
         command.push_str(" -- ");
         command.push_str(&shell_quote(f));
@@ -409,12 +430,13 @@ fn resolve_directory(request: &str, cwd: &Path) -> Result<std::path::PathBuf, &'
         return Err("could not find a directory matching the request");
     }
 
-    let mut queue = std::collections::VecDeque::from([(home, 0)]);
+    let mut queue = std::collections::VecDeque::from([(cwd.to_owned(), 0), (home, 0)]);
+    let mut visited = std::collections::HashSet::new();
     let mut remaining = 20_000;
     let mut best = None;
     let mut tied = false;
     while let Some((dir, depth)) = queue.pop_front() {
-        if depth == 3 || remaining == 0 {
+        if depth == 3 || remaining == 0 || !visited.insert(dir.clone()) {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -446,7 +468,7 @@ fn resolve_directory(request: &str, cwd: &Path) -> Result<std::path::PathBuf, &'
             };
             if let Some(rank) = rank {
                 match best.as_ref() {
-                    Some((current, _)) if rank == *current => tied = true,
+                    Some((current, previous)) if rank == *current => tied |= previous != &path,
                     Some((current, _)) if rank < *current => {}
                     _ => {
                         best = Some((rank, path.clone()));

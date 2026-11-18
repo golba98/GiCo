@@ -169,23 +169,31 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
     {
         return Intent::NavigateDir;
     }
+    if destination.is_some() {
+        return Intent::NavigateDir;
+    }
     // Build/run/test/clean (existing semantics, phrase-tolerant).
     let build = has(&[
         "compile",
         "build",
         "make ",
         "rebuild",
-        "link",
+        "link the",
         "fix the build",
     ]);
-    let run = has(&["run", "execute", "launch", "start"])
+    let run = r
+        .split_whitespace()
+        .any(|w| matches!(w, "run" | "execute" | "launch" | "start"))
+        || has(&["bring up", "open the graphical"])
         || r.split_whitespace()
             .next()
             .is_some_and(|w| w.len().abs_diff(6) <= 1 && strsim::osa_distance(w, "launch") <= 1);
     if r.starts_with("where does ") || r.starts_with("what is this project") {
         return Intent::Explain;
     }
-    let test = has(&["test", "testing"]);
+    let test = r
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| matches!(w, "test" | "tests" | "testing"));
     let clean = has(&["clean"]);
     if build && run {
         return Intent::BuildAndRun;
@@ -201,11 +209,14 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
     }
     // Git.
     let in_repo = scan.git.branch.is_some();
-    if in_repo || has(&["git "]) {
+    if in_repo || has(&["git ", "commits", "newest commit"]) {
         if has(&["diff", "changes", "what changed", "uncommitted"]) {
             return Intent::GitDiff;
         }
         if has(&[
+            "commit subjects",
+            "newest commit",
+            "recent commit",
             "log",
             "recent commits",
             "history",
@@ -226,7 +237,7 @@ pub fn classify(request: &str, scan: &RawScan) -> Intent {
         return Intent::InspectProcess;
     }
     // Package management.
-    if has(&["install ", "install this", "how do i install", "package"])
+    if has(&["install ", "install this", "how do i install"])
         && !has(&["npm install", "pip install", "cargo add"])
     {
         return Intent::InstallPackage;

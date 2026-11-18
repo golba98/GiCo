@@ -31,6 +31,7 @@ pub struct LlmClient {
     pub max_tokens: u32,
     pub context_size: u32,
     pub debug: bool,
+    pub usage: std::cell::RefCell<Option<(usize, usize, String)>>,
     pub prompt_chars: std::cell::Cell<usize>,
     pub idle_seconds: u32,
     discovered: std::cell::OnceCell<String>,
@@ -51,6 +52,8 @@ impl std::error::Error for LlmError {}
 #[derive(Deserialize)]
 struct OllamaChatResponse {
     done_reason: Option<String>,
+    prompt_eval_count: Option<usize>,
+    eval_count: Option<usize>,
     message: OllamaMessage,
 }
 #[derive(Deserialize)]
@@ -104,6 +107,7 @@ impl LlmClient {
             max_tokens: 256,
             context_size: 4096,
             debug: false,
+            usage: Default::default(),
             prompt_chars: Default::default(),
             idle_seconds: 300,
             discovered: Default::default(),
@@ -190,6 +194,10 @@ impl LlmClient {
     }
 
     pub fn resident(&self) -> Result<bool, LlmError> {
+        Ok(self.resident_context()? == Some(self.context_size as u64))
+    }
+
+    pub fn resident_context(&self) -> Result<Option<u64>, LlmError> {
         if self.backend != Backend::Ollama {
             return Err(LlmError("residency inspection requires Ollama".into()));
         }
@@ -205,12 +213,13 @@ impl LlmClient {
             let json: serde_json::Value =
                 serde_json::from_slice(&response_body(resp, 262144).await?)
                     .map_err(|e| LlmError(format!("bad residency response: {e}")))?;
-            Ok(json["models"].as_array().is_some_and(|models| {
-                models.iter().any(|m| {
-                    m["name"].as_str() == Some(&self.model)
-                        && m["context_length"].as_u64() == Some(self.context_size as u64)
-                })
-            }))
+            let models = json["models"]
+                .as_array()
+                .ok_or_else(|| LlmError("Ollama returned an invalid residency response".into()))?;
+            Ok(models
+                .iter()
+                .find(|m| m["name"].as_str() == Some(&self.model))
+                .and_then(|m| m["context_length"].as_u64()))
         })
     }
 
@@ -289,6 +298,13 @@ impl LlmClient {
         let parsed: OllamaChatResponse =
             serde_json::from_slice(&response_body(resp, 1_048_576).await?)
                 .map_err(|e| LlmError(format!("ollama bad response: {e}")))?;
+        self.usage.replace(parsed.prompt_eval_count.map(|n| {
+            (
+                n,
+                parsed.eval_count.unwrap_or(0),
+                parsed.done_reason.clone().unwrap_or_default(),
+            )
+        }));
         if parsed.done_reason.as_deref() == Some("length") {
             return Err(LlmError(
                 "response truncated at configured output limit".into(),
