@@ -2094,6 +2094,13 @@ fn main() {
                     pass += 1;
                 }
                 if args.verbose {
+                    for op in harness
+                        .ops()
+                        .iter()
+                        .filter(|op| op.detail.starts_with("OpenAI usage:"))
+                    {
+                        println!("  {}", op.detail);
+                    }
                     println!(
                         "  [{}] {} mode={} cmd=`{}` pass={} verdict={:?}",
                         case.name,

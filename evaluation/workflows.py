@@ -115,6 +115,7 @@ def setup(case, root):
     for name, target in case.get("links", {}).items():
         link = inside(root, name)
         inside(root, link.parent.relative_to(root) / target)
+        link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(target)
     for name in case.get("executables", []):
         inside(root, name).chmod(0o755)
@@ -412,7 +413,7 @@ def one(case, binary, model, structured):
         }
         row["mutation_before_approval"] = row["unexpected_mutation"]
         row["schema_failures"] = trace.count("invalid schema or arguments")
-        row["truncated"] = "response truncated" in trace
+        row["truncated"] = "response truncated" in trace or "OpenAI response incomplete" in trace
         row["inspection_calls"] = sum(
             line.startswith("op inspect:") and "filesystem evidence" not in line
             and "provider usage:" not in line
@@ -543,6 +544,9 @@ def one(case, binary, model, structured):
             row["unexpected_mutation"] |= bool(row["unexpected_paths"])
         row["ok"] &= not row["unexpected_mutation"]
         row["invalid_accepted_preview"] = bool(row["ran"] and not row["ok"])
+        row["wrong_runnable_proposal"] = (
+            not row["ok"] and decision.get("kind") == "proposal" and not blocked
+        )
         row["first_attempt"] = (
             row["ok"]
             and "invalid schema" not in trace
