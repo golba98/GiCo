@@ -345,8 +345,16 @@ fn resolve(cwd: &Path, path: &str) -> Option<PathBuf> {
 pub struct Harness {
     pub max_rounds: usize,
     rounds_used: usize,
+    inference_start: Option<std::time::Instant>,
     cancel: CancelToken,
     ops: Vec<OpRecord>,
+}
+
+fn remaining_call_budget(elapsed: std::time::Duration, rounds_used: usize) -> std::time::Duration {
+    use std::time::Duration;
+    Duration::from_secs(90)
+        .saturating_sub(elapsed)
+        .min(Duration::from_secs(if rounds_used == 0 { 60 } else { 30 }))
 }
 
 impl Harness {
@@ -354,9 +362,23 @@ impl Harness {
         Harness {
             max_rounds,
             rounds_used: 0,
+            inference_start: None,
             cancel: CancelToken::new(),
             ops: Vec::new(),
         }
+    }
+
+    pub fn inference_budget(&mut self) -> std::time::Duration {
+        let elapsed = self
+            .inference_start
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed();
+        remaining_call_budget(elapsed, self.rounds_used)
+    }
+
+    pub fn begin_refinement(&mut self) {
+        self.inference_start = None;
+        self.rounds_used = 0;
     }
 
     pub fn enable_interrupts(&mut self) {
@@ -534,5 +556,20 @@ mod tests {
         tok.cancel();
         let r = exec_shell("sleep 30", tmp.path(), &tok, Duration::from_secs(30)).unwrap();
         assert!(r.cancelled && !r.started);
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::remaining_call_budget;
+    use std::time::Duration as D;
+    #[test]
+    fn slow_first_call_leaves_time_for_inspection_and_repair() {
+        for (elapsed, rounds, budget) in [(0, 0, 60), (50, 1, 30), (78, 2, 12), (92, 2, 0)] {
+            assert_eq!(
+                remaining_call_budget(D::from_secs(elapsed), rounds),
+                D::from_secs(budget)
+            );
+        }
     }
 }

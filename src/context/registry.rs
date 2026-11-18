@@ -16,6 +16,7 @@ const MANIFESTS: &[&str] = &[
     "CMakeLists.txt",
     "package.json",
     "pyproject.toml",
+    "requirements.txt",
     "go.mod",
     "Makefile",
     ".git",
@@ -450,7 +451,30 @@ pub fn project_for(cwd: &Path, request: &str) -> Result<Option<PathBuf>, String>
     }
     match matched.as_slice() {
         [p] => Ok(Some(p.clone())),
-        [] if nav.is_none() => Ok(cwd.ancestors().find(|p| manifest(p)).map(Path::to_owned)),
+        [] if nav.is_none() => {
+            let root = cwd.ancestors().find(|p| manifest(p));
+            if let Some(nearest) = root.filter(|p| p.join("CMakeLists.txt").is_file()) {
+                // Subdirectory manifests often lack a project declaration. Walk only the
+                // containing project, stopping at a repository or another build system.
+                for p in nearest.ancestors() {
+                    if let Ok(source) = fs::read_text(&p.join("CMakeLists.txt"), 65536) {
+                        if source.lines().any(|line| {
+                            line.trim_start()
+                                .to_ascii_lowercase()
+                                .starts_with("project(")
+                        }) {
+                            return Ok(Some(p.to_owned()));
+                        }
+                    }
+                    if p.join(".git").exists()
+                        || (p != nearest && manifest(p) && !p.join("CMakeLists.txt").is_file())
+                    {
+                        break;
+                    }
+                }
+            }
+            Ok(root.map(Path::to_owned))
+        }
         [] => Ok(None),
         _ => Err(format!(
             "Which project do you mean? {}",

@@ -1802,11 +1802,11 @@ fn main() {
     let args = Args::parse();
     let mut cfg = Config::load(&gico::config::path().expect("config path"))
         .expect("valid GiCo configuration");
+    if let Some(value) = args.backend {
+        cfg.select_backend(&value);
+    }
     if let Some(value) = args.model {
         cfg.model = value;
-    }
-    if let Some(value) = args.backend {
-        cfg.backend = value;
     }
     if let Some(value) = args.endpoint {
         cfg.endpoint = value;
@@ -2094,6 +2094,13 @@ fn main() {
                     pass += 1;
                 }
                 if args.verbose {
+                    for op in harness
+                        .ops()
+                        .iter()
+                        .filter(|op| op.detail.starts_with("OpenAI usage:"))
+                    {
+                        println!("  {}", op.detail);
+                    }
                     println!(
                         "  [{}] {} mode={} cmd=`{}` pass={} verdict={:?}",
                         case.name,

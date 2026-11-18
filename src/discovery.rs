@@ -6,7 +6,7 @@ use crate::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Debug)]
 pub enum Reply {
@@ -20,6 +20,7 @@ pub enum Reply {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Turn {
     Inspect { tool: String, value: String },
+    Count { unit: String, source: String },
     Propose { argv: Vec<String> },
     Shell { command: String },
     Answer { text: String },
@@ -43,7 +44,7 @@ fn schema(allow_answer: bool, document_question: bool) -> Value {
             vec![
                 (
                     "tool",
-                    json!({"enum":["list","read","find","target","program"]}),
+                    json!({"type":"string","enum":["list","read","find","target","program"]}),
                 ),
                 ("value", string.clone()),
             ],
@@ -67,7 +68,7 @@ fn schema(allow_answer: bool, document_question: bool) -> Value {
     json!({"oneOf":variants})
 }
 
-fn inspect(raw: &RawScan, tool: &str, value: &str) -> Value {
+fn inspect(raw: &RawScan, tool: &str, value: &str, named_document: Option<&str>) -> Value {
     let cwd = &raw.environment.cwd;
     match tool {
         "find" => json!(raw
@@ -81,8 +82,10 @@ fn inspect(raw: &RawScan, tool: &str, value: &str) -> Value {
         "list" => json!(Tool::ListDir.call(&json!({"path":value,"limit":32}), cwd)),
         "program" => json!(Tool::CommandOnPath.call(&json!({"name":value}), cwd)),
         "read" => {
-            // Only read selected source or project metadata from a recognised project.
-            if raw.project.is_none()
+            // Outside a recognized project, only the exact document named by the
+            // user qualifies. The model cannot grant itself a wider read scope.
+            let named = named_document == Some(value);
+            if (!named && raw.project.is_none())
                 || !raw.entries.iter().any(|e| {
                     e.path == value
                         && (matches!(
@@ -90,15 +93,19 @@ fn inspect(raw: &RawScan, tool: &str, value: &str) -> Value {
                             crate::context::fs::FileKind::Source
                                 | crate::context::fs::FileKind::Build
                                 | crate::context::fs::FileKind::Doc
-                        ) || raw
-                            .project
-                            .as_ref()
-                            .is_some_and(|p| p.config_files.contains(&e.path)))
+                        ) || named && e.kind == crate::context::fs::FileKind::Config
+                            || raw
+                                .project
+                                .as_ref()
+                                .is_some_and(|p| p.config_files.contains(&e.path)))
                 })
             {
                 return json!({"error":"choose a discovered project source, document or manifest"});
             }
             let result = Tool::ReadHead.call(&json!({"path":value,"lines":16}), cwd);
+            if !result.ok {
+                return json!({"error":result.error.unwrap_or_else(|| "document unavailable".into())});
+            }
             let lower = result.output.to_string().to_lowercase();
             if [
                 "private key",
@@ -110,6 +117,8 @@ fn inspect(raw: &RawScan, tool: &str, value: &str) -> Value {
                 "secret",
                 "access_token",
                 "bearer ",
+                "sk-proj-",
+                "sk-svcacct-",
             ]
             .iter()
             .any(|p| lower.contains(p))
@@ -148,10 +157,15 @@ pub fn prompt(
         ]
         .iter()
         .any(|p| lower.starts_with(p));
-    let budget = ctx
-        .budget_tokens
-        .saturating_mul(4)
-        .min(client.context_size as usize * 2);
+    let budget =
+        ctx.budget_tokens
+            .saturating_mul(4)
+            .min((client.context_size as usize).saturating_sub(
+                client.max_tokens as usize
+                    + request.len()
+                    + feedback.map_or(0, |(p, n)| p.len() + n.len())
+                    + 1152,
+            ));
     let mut facts = json!({});
     if !no_context {
         let map = crate::context::registry::evidence(raw);
@@ -210,15 +224,24 @@ pub fn interpret(
     let (mut prompt, allow_answer) = prompt(client, engine, raw, request, feedback, no_context);
     let start = Instant::now();
     let cancel = harness.cancel_token();
-    let mut evidence_left = 8192;
+    // UTF-8 bytes upper-bound ordinary text tokens in these byte-level
+    // tokenizers. Reserve space for provider chat framing and generated output.
+    let available = (client.context_size as usize).saturating_sub(client.max_tokens as usize + 128);
+    let mut evidence_left = engine
+        .config
+        .budget_tokens
+        .saturating_mul(3)
+        .min(available.saturating_sub(prompt.len()));
     let question_word = request
         .split_ascii_whitespace()
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
     let asks_about_evidence = allow_answer
-        || matches!(question_word.as_str(), "which" | "when" | "who" | "how")
-            && request.trim_end().ends_with('?');
+        || matches!(
+            question_word.as_str(),
+            "what" | "where" | "which" | "when" | "who" | "how"
+        ) && request.trim_end().ends_with('?');
     let document = asks_about_evidence
         .then(|| {
             crate::constraints::requested_files(request)
@@ -227,17 +250,13 @@ pub fn interpret(
                 .collect::<Vec<_>>()
         })
         .and_then(|files| match files.as_slice() {
-            [path]
-                if !no_context
-                    && raw.project.is_some()
-                    && raw.entries.iter().any(|entry| &entry.path == path) =>
-            {
+            [path] if !no_context && raw.entries.iter().any(|entry| &entry.path == path) => {
                 Some(path.clone())
             }
             _ => None,
         });
     if let Some(path) = &document {
-        let result = inspect(raw, "read", path);
+        let result = inspect(raw, "read", path, Some(path));
         if let Some(error) = result["error"].as_str() {
             harness.record(OpKind::Inspect, "read", OpOutcome::Blocked(error.into()));
             return Ok(Reply::Clarify(format!(
@@ -246,7 +265,12 @@ pub fn interpret(
         }
         harness.record_duration(OpKind::Inspect, "read", OpOutcome::Ok, start.elapsed());
         let serialized = result["output"].to_string();
-        let max = engine.config.budget_tokens.saturating_mul(2).min(1600);
+        let max = engine
+            .config
+            .budget_tokens
+            .saturating_mul(2)
+            .min(1600)
+            .min(evidence_left);
         let excerpt = bounded(&serialized, max);
         evidence_left -= excerpt.len();
         prompt.push_str(&format!(
@@ -255,38 +279,95 @@ pub fn interpret(
         ));
     }
     let allow_answer = allow_answer || document.is_some();
-    let schema = schema(allow_answer, document.is_some());
-    for attempt in 0..3 {
+    let count = document
+        .is_none()
+        .then(|| crate::query::CountEvidence::from_request(request, raw))
+        .flatten();
+    let mut schema = schema(allow_answer, document.is_some());
+    if let Some(e) = &count {
+        // The model can select an operation or ask. Rust checks each returned slot.
+        let variants = schema["oneOf"].as_array_mut().expect("structured variants");
+        variants.retain(|v| {
+            matches!(
+                v["properties"]["kind"]["const"].as_str(),
+                Some("clarify" | "inspect")
+            )
+        });
+        variants.push(json!({"type":"object","properties":{"kind":{"const":"count"},"source":{"type":"string"},"unit":{"type":"string","enum":["bytes","words","lines","characters"]}},"required":["kind","source","unit"],"additionalProperties":false}));
+        prompt.push_str(&format!(
+            "A quantity request can use count.source and count.unit. Verified source: {}.\n",
+            json!(e.path)
+        ));
+    }
+    for _ in 0..3 {
+        let limit = harness.inference_budget();
+        if limit.is_zero() {
+            return Err("overall inference deadline exceeded".into());
+        }
         if !harness.next_round(OpKind::Generate, "structured inference") {
             return Err("discovery call limit reached".into());
         }
         let t = Instant::now();
-        let limit =
-            Duration::from_secs(if attempt == 0 { 60 } else { 30 }).saturating_sub(start.elapsed());
         client.prompt_chars.set(
             client
                 .prompt_chars
                 .get()
                 .saturating_add(prompt.chars().count()),
         );
+        if prompt.len() > available {
+            return Err("request exceeds the configured context after reserving output; shorten the request or increase context_size".into());
+        }
+        client.usage.replace(None);
+        client.cloud_usage.replace(Default::default());
         let reply = client.request(&prompt, &cancel, Some(&schema), limit);
+        if let Some((input, output, reason)) = client.usage.borrow().as_ref() {
+            harness.record(OpKind::Inspect,&format!("provider usage: {input} input, {output} output, stop={reason}, {} prompt bytes",prompt.len()),OpOutcome::Ok);
+        }
+        if client.backend == crate::llm::Backend::OpenAiResponses {
+            client.cloud_usage.borrow_mut().latency_ms = t.elapsed().as_millis();
+            let u = client.cloud_usage.borrow();
+            if crate::usage::record(&u).is_err() {
+                eprintln!("gico: could not update local usage totals");
+            }
+            harness.record(OpKind::Generate,&format!("OpenAI usage: {} requests, {} input ({} cached), {} output ({} reasoning), {} ms, estimated USD {}",u.attempts,u.input,u.cached,u.output,u.reasoning,u.latency_ms,u.estimated_usd.map_or("unavailable".into(),|n|format!("{n:.8}"))),OpOutcome::Ok);
+        }
         let outcome = match &reply {
             Ok(_) => OpOutcome::Ok,
             Err(e) => OpOutcome::Failed(e.to_string()),
         };
         harness.record_duration(OpKind::Generate, "provider response", outcome, t.elapsed());
-        if client.debug {
+        if client.debug && client.backend != crate::llm::Backend::OpenAiResponses {
             eprintln!("model input: {}", crate::ui::safe_multiline(&prompt));
         }
         let reply = reply.map_err(|e| e.to_string())?;
-        if client.debug {
+        if client.debug && client.backend != crate::llm::Backend::OpenAiResponses {
             eprintln!("model output: {}", crate::ui::safe_multiline(&reply));
         }
         let valid =
             |s: &str| !s.trim().is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control);
         match serde_json::from_str::<Turn>(&reply) {
+            Ok(Turn::Count { unit, source })
+                if count
+                    .as_ref()
+                    .is_some_and(|e| e.unit == unit && e.path == source) =>
+            {
+                harness.record(
+                    OpKind::Plan,
+                    &format!(
+                        "decoded count {}",
+                        json!({"kind":"count","source":source,"unit":unit})
+                    ),
+                    OpOutcome::Ok,
+                );
+                return count
+                    .as_ref()
+                    .expect("matched count")
+                    .command(&raw.environment.cwd)
+                    .map(Reply::Command);
+            }
             Ok(Turn::Propose { argv })
                 if document.is_none()
+                    && count.is_none()
                     && !argv.is_empty()
                     && argv.len() <= 64
                     && valid(&argv[0])
@@ -296,10 +377,12 @@ pub fn interpret(
             {
                 return Ok(Reply::Argv(argv))
             }
-            Ok(Turn::Shell { command }) if document.is_none() && valid(&command) => {
+            Ok(Turn::Shell { command })
+                if document.is_none() && count.is_none() && valid(&command) =>
+            {
                 return Ok(Reply::Command(command))
             }
-            Ok(Turn::Answer { text }) if allow_answer && valid(&text) => {
+            Ok(Turn::Answer { text }) if allow_answer && count.is_none() && valid(&text) => {
                 return Ok(Reply::Answer(text))
             }
             Ok(Turn::Clarify { question }) if valid(&question) => {
@@ -309,13 +392,18 @@ pub fn interpret(
                 if value.len() <= 512 && !value.chars().any(char::is_control) =>
             {
                 let t = Instant::now();
-                let result = inspect(raw, &tool, &value);
+                let result = inspect(raw, &tool, &value, document.as_deref());
                 let outcome = result
                     .get("error")
                     .and_then(Value::as_str)
                     .map_or(OpOutcome::Ok, |e| OpOutcome::Failed(e.to_owned()));
                 let evidence = result.to_string();
-                let part = bounded(&evidence, evidence_left.min(3000));
+                let part = bounded(
+                    &evidence,
+                    evidence_left
+                        .min(3000)
+                        .min(available.saturating_sub(prompt.len() + value.len() + 64)),
+                );
                 evidence_left -= part.len();
                 harness.record_duration(OpKind::Inspect, &tool, outcome, t.elapsed());
                 prompt.push_str(&format!("Inspection {}: {}\n", json!([tool, value]), part));
@@ -331,4 +419,29 @@ pub fn interpret(
         }
     }
     Err("discovery exhausted its three model calls".into())
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    #[test]
+    fn outside_projects_only_the_named_document_can_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schedule.yaml"), "station: polaris").unwrap();
+        std::fs::write(dir.path().join("contacts.md"), "private key: fixture").unwrap();
+        let raw = ContextEngine::new(Default::default())
+            .scan(dir.path())
+            .unwrap();
+        assert!(raw.project.is_none());
+        assert!(
+            inspect(&raw, "read", "schedule.yaml", Some("schedule.yaml"))["output"]
+                .to_string()
+                .contains("polaris")
+        );
+        assert!(inspect(&raw, "read", "contacts.md", Some("schedule.yaml"))["error"].is_string());
+        let result = inspect(&raw, "read", "contacts.md", Some("contacts.md"));
+        assert!(result["error"].as_str().unwrap().contains("withheld"));
+        assert!(!result.to_string().contains("fixture"));
+    }
 }

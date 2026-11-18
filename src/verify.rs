@@ -951,7 +951,20 @@ pub fn verify(command: &str, cwd: &Path, known: &[FileEntry]) -> Report {
                 continue; // URL, not a filesystem path
             }
             if let Some(prev) = c.words.get(wi.wrapping_sub(1)) {
-                if FLAGS_WITH_VALUE.contains(&prev.as_str()) {
+                // Interpret option values according to the utility. A literal grep
+                // pattern can look exactly like a missing file.
+                let control = match program {
+                    Some("grep" | "rg") => {
+                        matches!(prev.as_str(), "-e" | "--regexp" | "-m" | "--max-count")
+                    }
+                    Some("head" | "tail") => {
+                        matches!(prev.as_str(), "-n" | "--lines" | "-c" | "--bytes")
+                    }
+                    Some("find") => matches!(w.as_str(), "!" | "(" | ")"),
+                    _ => false,
+                };
+                let positional = c.words[..wi].iter().any(|word| word == "--");
+                if !positional && (control || FLAGS_WITH_VALUE.contains(&prev.as_str())) {
                     continue; // value of a flag (e.g. -type f), not a file
                 }
             }
@@ -1011,6 +1024,11 @@ pub fn verify(command: &str, cwd: &Path, known: &[FileEntry]) -> Report {
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_else(|| w.clone());
+            if (program == Some("cp") && wi + 1 == c.words.len() || program == Some("touch"))
+                && abs.parent().is_some_and(Path::is_dir)
+            {
+                continue;
+            }
             // Invented filename / wrong capitalization.
             let mut best: Option<(&str, usize, bool)> = None;
             for k in &known_names {
@@ -1140,34 +1158,93 @@ pub(crate) fn intent_issues_at(request: &str, command: &str, cwd: &Path) -> Vec<
             suggestion: Some("retain the requested path as one operand".into()),
         }];
     }
-    let read_only = matches!(
-        intent,
-        Intent::Explain
-            | Intent::ListDir
-            | Intent::InspectProcess
-            | Intent::InspectPort
-            | Intent::GitLog
-            | Intent::GitDiff
-            | Intent::GitStatus
-            | Intent::MemoryInfo
-            | Intent::DiskUsage
-    ) && ![
-        "save ", "write ", "create ", "replace ", "commit ", "install ", "remove ", "delete ",
-        "move ", "append ", "copy ",
-    ]
-    .iter()
-    .any(|verb| lower.contains(verb));
+    let action = lower
+        .split_whitespace()
+        .find(|w| !matches!(*w, "please" | "could" | "would" | "you"));
+    let reads = matches!(
+        action,
+        Some(
+            "show"
+                | "print"
+                | "emit"
+                | "read"
+                | "count"
+                | "report"
+                | "display"
+                | "find"
+                | "list"
+                | "sort"
+                | "filter"
+                | "collapse"
+                | "reverse"
+                | "compare"
+                | "extract"
+        )
+    );
+    let read_only = (reads
+        || matches!(
+            intent,
+            Intent::Explain
+                | Intent::ListDir
+                | Intent::InspectProcess
+                | Intent::InspectPort
+                | Intent::GitLog
+                | Intent::GitDiff
+                | Intent::GitStatus
+                | Intent::MemoryInfo
+                | Intent::DiskUsage
+        ))
+        && ![
+            "save ",
+            "write ",
+            "create ",
+            "replace ",
+            "commit ",
+            "install ",
+            "remove ",
+            "delete ",
+            "move ",
+            "append ",
+            "copy ",
+            "overwrite ",
+            " in place",
+            " in-place",
+            " into ",
+            " to a file",
+        ]
+        .iter()
+        .any(|verb| lower.contains(verb));
     if read_only {
         let commands = lex(command).and_then(|t| parse(&t)).unwrap_or_default();
         let writes = commands.iter().any(|c| {
-            c.redirects
-                .iter()
-                .any(|(op, dest)| op.contains('>') && dest != "/dev/null")
+            let program = c
+                .words
+                .first()
+                .and_then(|p| Path::new(p).file_name())
+                .and_then(|s| s.to_str());
+            let in_place = match program {
+                Some("sed" | "perl") => c.words.iter().skip(1).any(|w| {
+                    w.starts_with("--in-place")
+                        || w.starts_with('-') && !w.starts_with("--") && w.contains('i')
+                }),
+                Some("sort") => c
+                    .words
+                    .iter()
+                    .skip(1)
+                    .any(|w| w.starts_with("-o") || w.starts_with("--output")),
+                Some("find") => c.words.iter().any(|w| w == "-delete"),
+                _ => false,
+            };
+            in_place
+                || c.redirects
+                    .iter()
+                    .any(|(op, dest)| op.contains('>') && dest != "/dev/null")
                 || c.words.first().is_some_and(|p| {
                     matches!(
                         Path::new(p).file_name().and_then(|n| n.to_str()),
                         Some(
                             "rm" | "mv"
+                                | "cp"
                                 | "touch"
                                 | "tee"
                                 | "chmod"
@@ -1227,14 +1304,44 @@ pub(crate) fn intent_issues_at(request: &str, command: &str, cwd: &Path) -> Vec<
     }
     // "build AND run" requests must contain a run step, not only build steps.
     if intent == Intent::BuildAndRun {
-        const BUILD_TOOLS: &[&str] = &[
-            "cmake", "make", "ninja", "cargo", "npm", "pnpm", "yarn", "bun", "g++", "gcc", "clang",
-            "clang++", "cc", "c++", "go", "javac", "ctest", "meson", "ninja",
-        ];
-        let has_run_step = command.split("&&").any(|seg| {
-            let first = tokenize(seg).first().cloned().unwrap_or_default();
-            let base = first.rsplit('/').next().unwrap_or(&first);
-            !first.is_empty() && !BUILD_TOOLS.contains(&base)
+        let stages = lex(command).and_then(|t| parse(&t)).unwrap_or_default();
+        let has_run_step = stages.iter().any(|stage| {
+            let Some((program, args)) = stage.words.split_first() else {
+                return false;
+            };
+            let name = Path::new(program)
+                .file_name()
+                .and_then(|p| p.to_str())
+                .unwrap_or("");
+            let sub = args.first().map(String::as_str);
+            match name {
+                "cargo" | "go" => sub == Some("run"),
+                "npm" | "pnpm" | "yarn" | "bun" => {
+                    let script = if matches!(sub, Some("run" | "run-script")) {
+                        args.get(1).map(String::as_str)
+                    } else {
+                        sub
+                    };
+                    script.is_some_and(|s| {
+                        matches!(s, "start" | "dev" | "serve")
+                            && crate::context::fs::read_text(&cwd.join("package.json"), 65536)
+                                .ok()
+                                .and_then(|text| {
+                                    serde_json::from_str::<serde_json::Value>(&text).ok()
+                                })
+                                .is_some_and(|pkg| pkg["scripts"][s].is_string())
+                    })
+                }
+                "python" | "python3" | "node" => {
+                    args.first().is_some_and(|s| cwd.join(s).is_file())
+                }
+                _ => {
+                    program.starts_with("./")
+                        || (Path::new(program).is_absolute()
+                            && Path::new(program).starts_with(cwd)
+                            && Path::new(program).is_file())
+                }
+            }
         });
         if !has_run_step {
             return vec![Issue {

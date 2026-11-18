@@ -153,10 +153,32 @@ pub fn verify_candidate(
     report
         .issues
         .extend(verify::intent_issues_at(request, &command, cwd));
+    let query = crate::query::Query::parse(request);
+    if let Some(expected) = query
+        .as_ref()
+        .map(|q| q.render(cwd))
+        .or_else(|| crate::query::CountEvidence::from_request(request, raw).map(|e| e.command(cwd)))
+    {
+        if !expected.as_ref().is_ok_and(|planned| {
+            planned == &command
+                || verify::literal_words(planned)
+                    .zip(verify::literal_words(&command))
+                    .is_some_and(|(a, b)| a == b)
+        }) {
+            report.issues.push(Issue {
+                severity: Severity::Error,
+                message: expected.err().unwrap_or_else(|| {
+                    "command does not preserve the verified query, inputs and destination".into()
+                }),
+                suggestion: None,
+            });
+        }
+    }
     if matches!(
         intent::classify(request, raw),
         Intent::Run | Intent::BuildAndRun
-    ) && plan::requested_target_kind(request).is_some()
+    ) && query.is_none()
+        && plan::requested_target_kind(request).is_some()
         && !matches_named_launch(raw, request, &command)
     {
         report.issues.push(Issue {
@@ -311,6 +333,91 @@ pub fn authorize(
     })
 }
 
+fn missing_choice(raw: &RawScan, request: &str) -> Option<String> {
+    let lower = request.to_lowercase();
+    let words: Vec<_> = lower.split_whitespace().collect();
+    let has = |word: &str| words.contains(&word);
+    // Stream operations need an actual input. A demonstrative alone cannot
+    // identify a file or authorize substituting a directory listing.
+    let stream = words
+        .iter()
+        .any(|w| matches!(*w, "sort" | "filter" | "count" | "reverse" | "deduplicate"));
+    let reference = words.windows(2).any(|w| {
+        matches!(w[0], "these" | "those")
+            && matches!(
+                w[1].trim_end_matches(['?', '.']),
+                "values" | "rows" | "records" | "lines" | "numbers"
+            )
+    });
+    let operands = shlex::split(request.trim_end_matches('?')).unwrap_or_default();
+    if stream
+        && reference
+        && !request.contains(':')
+        && !request.chars().any(|c| c.is_ascii_digit())
+        && !raw.entries.iter().any(|entry| {
+            entry.kind != crate::context::fs::FileKind::Directory
+                && operands
+                    .iter()
+                    .any(|w| w.trim_start_matches("./") == entry.path)
+        })
+    {
+        return Some("Which file or values should I use as the input?".into());
+    }
+    if intent::classify(request, raw) == Intent::GitLog && raw.git.branch.is_none() {
+        return Some("Which repository should I use? There is no Git history here.".into());
+    }
+    if (has("attach") || has("attached")) && raw.entries.iter().all(|e| !request.contains(&e.path))
+    {
+        return Some(
+            "Which file should I read? Provide the missing attachment or its path.".into(),
+        );
+    }
+    if (has("send") || has("deploy") || has("upload"))
+        && (has("usual") || has("my") && has("server"))
+        && !words
+            .iter()
+            .any(|w| w.contains('@') || w.contains("://") || w.contains(':'))
+    {
+        return Some("Which destination should receive the files?".into());
+    }
+    if has("previous")
+        && (has("compare") || has("difference"))
+        && raw
+            .entries
+            .iter()
+            .filter(|e| request.contains(&e.path))
+            .count()
+            < 2
+    {
+        return Some("Which previous result or file should I compare with this one?".into());
+    }
+    if words.len() <= 3 && has("it") && (has("fix") || has("repair")) {
+        return Some("What command or error should I fix?".into());
+    }
+    if has("meant") || lower.contains("equally named") {
+        let candidates: Vec<_> = raw
+            .entries
+            .iter()
+            .filter(|e| e.kind != crate::context::fs::FileKind::Directory)
+            .filter(|e| {
+                words
+                    .iter()
+                    .any(|w| w.len() > 2 && e.name.to_lowercase().contains(*w))
+                    || lower.contains("equally named")
+            })
+            .map(|e| e.path.as_str())
+            .take(4)
+            .collect();
+        if candidates.len() > 1 {
+            return Some(format!(
+                "Which file do you mean: {}?",
+                candidates.join(" or ")
+            ));
+        }
+    }
+    None
+}
+
 pub fn prepare(
     harness: &mut Harness,
     raw: &RawScan,
@@ -320,6 +427,12 @@ pub fn prepare(
     if harness.cancel_token().is_cancelled() {
         harness.record(OpKind::Plan, "initial preparation", OpOutcome::Cancelled);
         return Preparation::Cancelled;
+    }
+    if !request.contains("\nClarification:") {
+        if let Some(question) = missing_choice(raw, request) {
+            harness.record(OpKind::Plan, "missing evidence", OpOutcome::Ok);
+            return Preparation::Clarify(question);
+        }
     }
     if let Some((title, detail)) = crate::context::informational_response(request, raw) {
         harness.record(OpKind::Plan, "informational", OpOutcome::Ok);

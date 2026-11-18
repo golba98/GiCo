@@ -22,3 +22,9 @@ pub mod runtime;
 pub mod shell;
 pub mod ui;
 pub mod verify;
+
+mod query;
+
+pub mod auth;
+pub mod responses;
+pub mod usage;

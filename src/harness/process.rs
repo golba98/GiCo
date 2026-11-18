@@ -212,6 +212,7 @@ pub(super) fn exec_process(
             (0, 0),
         ));
     }
+    command_builder.env_remove("OPENAI_API_KEY");
     let foreground = Foreground::current();
     let handoff = foreground.is_some();
     command_builder

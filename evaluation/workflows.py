@@ -115,6 +115,7 @@ def setup(case, root):
     for name, target in case.get("links", {}).items():
         link = inside(root, name)
         inside(root, link.parent.relative_to(root) / target)
+        link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(target)
     for name in case.get("executables", []):
         inside(root, name).chmod(0o755)
@@ -183,6 +184,8 @@ def approved(
     model_called,
     peers=0,
     legacy=False,
+    audit=None,
+    final_reply=None,
 ):
     # Replay the live proposal at GiCo's actual approval screen inside the fixture.
     # Only the second model response is injected. Verification and dispatch are real.
@@ -202,6 +205,8 @@ def approved(
                 "--setenv",
                 "GICO_ENDPOINT",
                 "http://127.0.0.1:19018",
+                "--setenv", "GICO_BACKEND", "ollama",
+                "--setenv", "GICO_MODEL", "fixture",
             ]
         )
         if legacy:
@@ -213,7 +218,7 @@ def approved(
                 if decision.get("argv")
                 else {"kind": "shell", "command": command}
             )
-            args.extend(["--setenv", "FIXTURE_REPLY", json.dumps(response)])
+            args.extend(["--setenv", "FIXTURE_REPLY", json.dumps(final_reply or response)])
         startup = ""
         if peers:
             startup += "for i in 1 2 3 4 5; do sleep 8 & done; "
@@ -238,11 +243,12 @@ s.server_close(); os.execv('/gico-fixture',['/gico-fixture',*sys.argv[1:]])
             prefix = "exec python3 -c " + shlex.quote(supervisor)
         else:
             prefix = "exec /gico-fixture"
+        replay_options = "" if legacy else ' --verbose'
         args.extend(
             [
                 "/bin/sh",
                 "-c",
-                startup + prefix + ' --no-cache --cd-hook-dir "$1" "$2"',
+                startup + prefix + replay_options + ' --no-cache --cd-hook-dir "$1" "$2" 2>"$1/replay.log"',
                 "replay",
                 handoff,
                 case["request"],
@@ -265,6 +271,8 @@ s.server_close(); os.execv('/gico-fixture',['/gico-fixture',*sys.argv[1:]])
                 p.send("c")
                 return 125, "", f"approval withheld: replay proposed {previewed!r}"
             p.send("\r")
+            if audit is not None:
+                audit["enter_sent"] = True
             idx = p.expect(
                 [
                     pexpect.EOF,
@@ -277,6 +285,12 @@ s.server_close(); os.execv('/gico-fixture',['/gico-fixture',*sys.argv[1:]])
             output = p.before.replace("\r", "").strip("\n")
             if idx != 0:
                 p.send("c")
+                try:
+                    p.expect(pexpect.EOF, timeout=2)
+                except pexpect.TIMEOUT:
+                    pass
+                if audit is not None:
+                    audit["pty_failure"] = ["", "child failed", "input changed", "dispatch failed", "PTY timeout"][idx]
                 return (
                     (125 if idx == 2 else 126),
                     output,
@@ -289,10 +303,19 @@ s.server_close(); os.execv('/gico-fixture',['/gico-fixture',*sys.argv[1:]])
             if target.is_file():
                 output = target.read_bytes().rstrip(b"\x00").decode()
             return 0, output, ""
-        except (pexpect.EOF, pexpect.TIMEOUT) as e:
-            return 125, "", "no matching verified approval: " + str(e.before)[:512]
+        except (pexpect.EOF, pexpect.TIMEOUT):
+            return 125, "", "no matching verified approval: " + str(p.before)[:512]
         finally:
             p.close(force=True)
+            log = Path(handoff) / "replay.log"
+            if audit is not None and log.is_file():
+                trace = log.read_text(errors="replace")[-16384:]
+                audit["trace"] = trace
+                audit["approved"] = any(line.startswith("op approve:") and " (Ok," in line for line in trace.splitlines())
+                audit["dispatched"] = any(line.startswith(("op execute:", "op navigate:")) and (" (Ok," in line or 'Failed("exited with code ' in line) for line in trace.splitlines())
+                if audit["dispatched"]:
+                    failed = re.search(r'op execute: .*Failed\("exited with code (\d+)"\)', trace)
+                    audit["child_exit"] = int(failed[1]) if failed else 0
 
 
 def preview(stdout):
@@ -390,9 +413,10 @@ def one(case, binary, model, structured):
         }
         row["mutation_before_approval"] = row["unexpected_mutation"]
         row["schema_failures"] = trace.count("invalid schema or arguments")
-        row["truncated"] = "response truncated" in trace
+        row["truncated"] = "response truncated" in trace or "OpenAI response incomplete" in trace
         row["inspection_calls"] = sum(
             line.startswith("op inspect:") and "filesystem evidence" not in line
+            and "provider usage:" not in line
             for line in trace.splitlines()
         )
         row["repair_attempts"] = (
@@ -438,6 +462,11 @@ def one(case, binary, model, structured):
             if root != cwd and "Working directory" in text and str(root) in text:
                 workdir = root
 
+            audit = {}
+
+            structured_counts = [line.removeprefix("op plan: decoded count ").rsplit(" (", 1)[0] for line in trace.splitlines() if line.startswith("op plan: decoded count ")]
+            final_reply = json.loads(structured_counts[-1]) if structured_counts else None
+
             def executor(peers=0):
                 return approved(
                     binary,
@@ -450,10 +479,14 @@ def one(case, binary, model, structured):
                     calls > 0,
                     peers,
                     legacy=not structured,
+                    audit=audit if not peers else None,
+                    final_reply=final_reply,
                 )
 
             rc, out, err = executor()
-            row.update(ran=rc != 125, rc=rc, stdout=out, stderr=err)
+            row.update(ran=rc != 125, rc=rc, stdout=out, stderr=err, approval=audit)
+            if structured and audit.get("dispatched") and audit.get("child_exit") != rc:
+                row["child_exit"] = audit["child_exit"]
             if oracle == "history":
                 flags = case.get("git_args", [])
                 expected = git(
@@ -511,6 +544,9 @@ def one(case, binary, model, structured):
             row["unexpected_mutation"] |= bool(row["unexpected_paths"])
         row["ok"] &= not row["unexpected_mutation"]
         row["invalid_accepted_preview"] = bool(row["ran"] and not row["ok"])
+        row["wrong_runnable_proposal"] = (
+            not row["ok"] and decision.get("kind") == "proposal" and not blocked
+        )
         row["first_attempt"] = (
             row["ok"]
             and "invalid schema" not in trace
