@@ -301,3 +301,31 @@ fn genuine_target_ambiguity_accepts_a_number_without_guessing() {
         "cargo run --bin second"
     );
 }
+
+#[test]
+fn navigation_combines_the_project_name_and_documented_purpose() {
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("Development/Signal Emulator");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\nmembers=[]").unwrap();
+    fs::write(
+        project.join("README.md"),
+        "# Signal Emulator\n\nInspect a handheld calculator on the desktop.\n",
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_gico"))
+        .args([
+            "--backend",
+            "ollama",
+            "--no-cache",
+            "--proposal-json",
+            "take me to that calculator emulator",
+        ])
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(output["command"], format!("cd '{}'", project.display()));
+}

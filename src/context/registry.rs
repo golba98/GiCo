@@ -169,30 +169,7 @@ fn facts(raw: &RawScan) -> Value {
         matches!(e.name.as_str(),"main.rs"|"main.py"|"__main__.py"|"main.cpp"|"index.ts"|"index.js"|"README.md")))
         .take(32).map(|e|json!({"path":e.path,"role":if MANIFESTS.contains(&e.name.as_str()) {"manifest"} else if e.name=="README.md" {"documentation"} else {"entrypoint candidate"},
             "mtime":root.join(&e.path).metadata().ok().map(|m|m.mtime()),"bytes":e.size})).collect();
-    let mut purpose = None;
-    for (file, section) in [
-        ("Cargo.toml", "package"),
-        ("pyproject.toml", "project"),
-        ("package.json", ""),
-    ] {
-        if let Ok(text) = fs::read_text(&root.join(file), 65536) {
-            purpose = if section.is_empty() {
-                serde_json::from_str::<Value>(&text)
-                    .ok()
-                    .and_then(|v| v["description"].as_str().map(str::to_owned))
-            } else {
-                toml::from_str::<toml::Value>(&text).ok().and_then(|v| {
-                    v.get(section)?
-                        .get("description")?
-                        .as_str()
-                        .map(str::to_owned)
-                })
-            };
-            if purpose.is_some() {
-                break;
-            }
-        }
-    }
+    let purpose = project_purpose(root);
     let mut entries = Vec::new();
     if let Ok(text) = fs::read_text(&root.join("package.json"), 65536) {
         if let Ok(pkg) = serde_json::from_str::<Value>(&text) {
@@ -277,7 +254,10 @@ pub fn evidence(raw: &RawScan) -> Value {
     let facts = stored
         .map(|mut record| record["facts"].take())
         .unwrap_or_else(|| facts(raw));
-    json!({"observations":facts,"preferences":prefs.ok()})
+    let preferences = prefs
+        .ok()
+        .map(|p| json!({"aliases":p.aliases,"roles":p.roles,"purpose":p.purpose}));
+    json!({"observations":facts,"preferences":preferences})
 }
 
 pub fn alias(root: &Path, alias: &str) -> io::Result<()> {
@@ -450,6 +430,47 @@ struct LocationFacts {
     purpose: String,
 }
 
+fn project_purpose(root: &Path) -> Option<String> {
+    let mut purpose = None;
+    for (file, section) in [
+        ("Cargo.toml", "package"),
+        ("pyproject.toml", "project"),
+        ("package.json", ""),
+    ] {
+        if let Ok(text) = fs::read_text(&root.join(file), 65536) {
+            purpose = if section.is_empty() {
+                serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v["description"].as_str().map(str::to_owned))
+            } else {
+                toml::from_str::<toml::Value>(&text).ok().and_then(|v| {
+                    v.get(section)?
+                        .get("description")?
+                        .as_str()
+                        .map(str::to_owned)
+                })
+            };
+            if purpose.is_some() {
+                break;
+            }
+        }
+    }
+    purpose
+}
+
+// The introduction is used locally for ranking. It is not part of model context.
+fn readme_purpose(root: &Path) -> Option<String> {
+    let text = fs::read_text(&root.join("README.md"), 65536).ok()?;
+    let introduction = text
+        .lines()
+        .take(18)
+        .filter(|line| !line.starts_with(['[', '!']) && !line.starts_with("```"))
+        .take_while(|line| !line.starts_with("## "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!introduction.trim().is_empty()).then(|| introduction.chars().take(460).collect())
+}
+
 fn location_facts(path: &Path) -> LocationFacts {
     let Some(base) = data()
         .ok()
@@ -461,33 +482,8 @@ fn location_facts(path: &Path) -> LocationFacts {
     let prefs = read::<Preferences>(&base.join("preferences.json")).unwrap_or_default();
     let purpose = prefs
         .purpose
-        .or_else(|| {
-            let record = read::<Value>(&base.join("context.json")).ok()?;
-            record["facts"]["purpose"].as_str().map(str::to_owned)
-        })
-        .or_else(|| {
-            for name in ["Cargo.toml", "pyproject.toml", "package.json"] {
-                if let Ok(text) = fs::read_text(&path.join(name), 65536) {
-                    let value = if name == "package.json" {
-                        serde_json::from_str::<Value>(&text).ok()
-                    } else {
-                        toml::from_str::<toml::Value>(&text)
-                            .ok()
-                            .and_then(|doc| serde_json::to_value(doc).ok())
-                    };
-                    if let Some(v) = value {
-                        if let Some(desc) = v["description"]
-                            .as_str()
-                            .or(v["package"]["description"].as_str())
-                            .or(v["project"]["description"].as_str())
-                        {
-                            return Some(desc.into());
-                        }
-                    }
-                }
-            }
-            None
-        })
+        .or_else(|| project_purpose(path))
+        .or_else(|| readme_purpose(path))
         .unwrap_or_default()
         .to_lowercase();
     LocationFacts {
@@ -672,6 +668,7 @@ fn ancestor_project(cwd: &Path) -> Option<PathBuf> {
 const NAV_STOPWORDS: &[&str] = &[
     "my",
     "the",
+    "that",
     "a",
     "an",
     "to",
@@ -937,12 +934,19 @@ fn rank_locations(
             directory_rank(&path, &lower_name, &meaningful)
                 .map(|r| 30 + r)
                 .or_else(|| {
+                    let name = directory_words(&lower_name);
+                    let purpose = directory_words(&facts.purpose);
                     (!facts.purpose.is_empty()
                         && !meaningful.is_empty()
                         && meaningful
                             .iter()
-                            .all(|token| directory_words(&facts.purpose).any(|w| w == *token)))
-                    .then_some(20)
+                            .all(|token| name.clone().chain(purpose.clone()).any(|w| w == *token)))
+                    .then(|| {
+                        20 + 3 * meaningful
+                            .iter()
+                            .filter(|token| name.clone().any(|w| w == **token))
+                            .count()
+                    })
                 })
         };
         if let Some(rank) = rank {
