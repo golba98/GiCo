@@ -353,6 +353,9 @@ fn main() -> ExitCode {
             }
             match client.list_models() {
                 Ok(models) if models.contains(&cfg.model) => (),
+                Ok(_) if client.backend == Backend::OpenAiResponses => {
+                    return io_error("model access", format!("the OpenAI project does not list {}. Check the API project's model access or use gico --backend openai models.", cfg.model));
+                }
                 Ok(_) => {
                     return io_error(
                         "model missing",
