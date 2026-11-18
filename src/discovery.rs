@@ -68,7 +68,7 @@ fn schema(allow_answer: bool, document_question: bool) -> Value {
     json!({"oneOf":variants})
 }
 
-fn inspect(raw: &RawScan, tool: &str, value: &str) -> Value {
+fn inspect(raw: &RawScan, tool: &str, value: &str, named_document: Option<&str>) -> Value {
     let cwd = &raw.environment.cwd;
     match tool {
         "find" => json!(raw
@@ -82,8 +82,10 @@ fn inspect(raw: &RawScan, tool: &str, value: &str) -> Value {
         "list" => json!(Tool::ListDir.call(&json!({"path":value,"limit":32}), cwd)),
         "program" => json!(Tool::CommandOnPath.call(&json!({"name":value}), cwd)),
         "read" => {
-            // Only read selected source or project metadata from a recognised project.
-            if raw.project.is_none()
+            // Outside a recognized project, only the exact document named by the
+            // user qualifies. The model cannot grant itself a wider read scope.
+            let named = named_document == Some(value);
+            if (!named && raw.project.is_none())
                 || !raw.entries.iter().any(|e| {
                     e.path == value
                         && (matches!(
@@ -91,15 +93,19 @@ fn inspect(raw: &RawScan, tool: &str, value: &str) -> Value {
                             crate::context::fs::FileKind::Source
                                 | crate::context::fs::FileKind::Build
                                 | crate::context::fs::FileKind::Doc
-                        ) || raw
-                            .project
-                            .as_ref()
-                            .is_some_and(|p| p.config_files.contains(&e.path)))
+                        ) || named && e.kind == crate::context::fs::FileKind::Config
+                            || raw
+                                .project
+                                .as_ref()
+                                .is_some_and(|p| p.config_files.contains(&e.path)))
                 })
             {
                 return json!({"error":"choose a discovered project source, document or manifest"});
             }
             let result = Tool::ReadHead.call(&json!({"path":value,"lines":16}), cwd);
+            if !result.ok {
+                return json!({"error":result.error.unwrap_or_else(|| "document unavailable".into())});
+            }
             let lower = result.output.to_string().to_lowercase();
             if [
                 "private key",
@@ -111,6 +117,8 @@ fn inspect(raw: &RawScan, tool: &str, value: &str) -> Value {
                 "secret",
                 "access_token",
                 "bearer ",
+                "sk-proj-",
+                "sk-svcacct-",
             ]
             .iter()
             .any(|p| lower.contains(p))
@@ -242,17 +250,13 @@ pub fn interpret(
                 .collect::<Vec<_>>()
         })
         .and_then(|files| match files.as_slice() {
-            [path]
-                if !no_context
-                    && raw.project.is_some()
-                    && raw.entries.iter().any(|entry| &entry.path == path) =>
-            {
+            [path] if !no_context && raw.entries.iter().any(|entry| &entry.path == path) => {
                 Some(path.clone())
             }
             _ => None,
         });
     if let Some(path) = &document {
-        let result = inspect(raw, "read", path);
+        let result = inspect(raw, "read", path, Some(path));
         if let Some(error) = result["error"].as_str() {
             harness.record(OpKind::Inspect, "read", OpOutcome::Blocked(error.into()));
             return Ok(Reply::Clarify(format!(
@@ -388,7 +392,7 @@ pub fn interpret(
                 if value.len() <= 512 && !value.chars().any(char::is_control) =>
             {
                 let t = Instant::now();
-                let result = inspect(raw, &tool, &value);
+                let result = inspect(raw, &tool, &value, document.as_deref());
                 let outcome = result
                     .get("error")
                     .and_then(Value::as_str)
@@ -415,4 +419,29 @@ pub fn interpret(
         }
     }
     Err("discovery exhausted its three model calls".into())
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    #[test]
+    fn outside_projects_only_the_named_document_can_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schedule.yaml"), "station: polaris").unwrap();
+        std::fs::write(dir.path().join("contacts.md"), "private key: fixture").unwrap();
+        let raw = ContextEngine::new(Default::default())
+            .scan(dir.path())
+            .unwrap();
+        assert!(raw.project.is_none());
+        assert!(
+            inspect(&raw, "read", "schedule.yaml", Some("schedule.yaml"))["output"]
+                .to_string()
+                .contains("polaris")
+        );
+        assert!(inspect(&raw, "read", "contacts.md", Some("schedule.yaml"))["error"].is_string());
+        let result = inspect(&raw, "read", "contacts.md", Some("contacts.md"));
+        assert!(result["error"].as_str().unwrap().contains("withheld"));
+        assert!(!result.to_string().contains("fixture"));
+    }
 }

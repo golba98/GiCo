@@ -553,16 +553,15 @@ impl Query {
             Search::Link
         } else if let Some(c) = captures!(r"files (?:larger|bigger) than ([0-9]+) bytes", body) {
             Search::Larger(c[1].parse().ok()?)
-        } else if let Some(c) = captures!(
-            r"files (?:that )?(?:contain|containing|matching) (?:the )?(?:(regex|literal) )?([^ ]+)",
-            body
-        ) {
+        } else {
+            let c = captures!(
+                r"files (?:that )?(?:contain|containing|matching) (?:the )?(?:(regex|literal) )?([^ ]+)",
+                body
+            )?;
             Search::Content(
                 literal(&c[2]),
                 c.get(1).is_some_and(|m| m.as_str() == "regex"),
             )
-        } else {
-            return None;
         };
         Some(Self::Search {
             scope,
