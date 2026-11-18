@@ -337,6 +337,32 @@ fn missing_choice(raw: &RawScan, request: &str) -> Option<String> {
     let lower = request.to_lowercase();
     let words: Vec<_> = lower.split_whitespace().collect();
     let has = |word: &str| words.contains(&word);
+    // Stream operations need an actual input. A demonstrative alone cannot
+    // identify a file or authorize substituting a directory listing.
+    let stream = words
+        .iter()
+        .any(|w| matches!(*w, "sort" | "filter" | "count" | "reverse" | "deduplicate"));
+    let reference = words.windows(2).any(|w| {
+        matches!(w[0], "these" | "those")
+            && matches!(
+                w[1].trim_end_matches(['?', '.']),
+                "values" | "rows" | "records" | "lines" | "numbers"
+            )
+    });
+    let operands = shlex::split(request.trim_end_matches('?')).unwrap_or_default();
+    if stream
+        && reference
+        && !request.contains(':')
+        && !request.chars().any(|c| c.is_ascii_digit())
+        && !raw.entries.iter().any(|entry| {
+            entry.kind != crate::context::fs::FileKind::Directory
+                && operands
+                    .iter()
+                    .any(|w| w.trim_start_matches("./") == entry.path)
+        })
+    {
+        return Some("Which file or values should I use as the input?".into());
+    }
     if intent::classify(request, raw) == Intent::GitLog && raw.git.branch.is_none() {
         return Some("Which repository should I use? There is no Git history here.".into());
     }

@@ -170,3 +170,37 @@ fn printing_or_filtering_cannot_replace_its_input() {
     );
     assert_eq!(c.command, "uniq -- sensor");
 }
+
+#[test]
+fn command_options_and_predicates_are_not_input_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("x"), "310\n").unwrap();
+    fs::write(root.join("data"), "1.4\n").unwrap();
+    for command in [
+        "find . -type f ! -name bad",
+        "grep -F -e 1.4 -- data",
+        "tail -n 3 -- data",
+    ] {
+        let raw = ContextEngine::new(Default::default()).scan(root).unwrap();
+        assert_ne!(
+            gico::verify::verify(command, root, &raw.entries).verdict(),
+            Verdict::Blocked,
+            "{command}"
+        );
+    }
+    let raw = ContextEngine::new(Default::default()).scan(root).unwrap();
+    assert_eq!(
+        gico::verify::verify("tail -n 3 -- ./missing", root, &raw.entries).verdict(),
+        Verdict::Blocked
+    );
+    assert!(matches!(
+        pipeline::prepare(
+            &mut Harness::new(3),
+            &raw,
+            "please reverse these rows",
+            |_, _| panic!("ungrounded")
+        ),
+        pipeline::Preparation::Clarify(_)
+    ));
+}

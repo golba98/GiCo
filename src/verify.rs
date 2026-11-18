@@ -951,7 +951,20 @@ pub fn verify(command: &str, cwd: &Path, known: &[FileEntry]) -> Report {
                 continue; // URL, not a filesystem path
             }
             if let Some(prev) = c.words.get(wi.wrapping_sub(1)) {
-                if FLAGS_WITH_VALUE.contains(&prev.as_str()) {
+                // Interpret option values according to the utility. A literal grep
+                // pattern can look exactly like a missing file.
+                let control = match program {
+                    Some("grep" | "rg") => {
+                        matches!(prev.as_str(), "-e" | "--regexp" | "-m" | "--max-count")
+                    }
+                    Some("head" | "tail") => {
+                        matches!(prev.as_str(), "-n" | "--lines" | "-c" | "--bytes")
+                    }
+                    Some("find") => matches!(w.as_str(), "!" | "(" | ")"),
+                    _ => false,
+                };
+                let positional = c.words[..wi].iter().any(|word| word == "--");
+                if !positional && (control || FLAGS_WITH_VALUE.contains(&prev.as_str())) {
                     continue; // value of a flag (e.g. -type f), not a file
                 }
             }

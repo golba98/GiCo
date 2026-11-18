@@ -44,7 +44,7 @@ fn schema(allow_answer: bool, document_question: bool) -> Value {
             vec![
                 (
                     "tool",
-                    json!({"enum":["list","read","find","target","program"]}),
+                    json!({"type":"string","enum":["list","read","find","target","program"]}),
                 ),
                 ("value", string.clone()),
             ],
@@ -289,7 +289,7 @@ pub fn interpret(
                 Some("clarify" | "inspect")
             )
         });
-        variants.push(json!({"type":"object","properties":{"kind":{"const":"count"},"source":{"type":"string"},"unit":{"enum":["bytes","words","lines","characters"]}},"required":["kind","source","unit"],"additionalProperties":false}));
+        variants.push(json!({"type":"object","properties":{"kind":{"const":"count"},"source":{"type":"string"},"unit":{"type":"string","enum":["bytes","words","lines","characters"]}},"required":["kind","source","unit"],"additionalProperties":false}));
         prompt.push_str(&format!(
             "A quantity request can use count.source and count.unit. Verified source: {}.\n",
             json!(e.path)

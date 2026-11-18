@@ -107,7 +107,13 @@ impl LlmClient {
             .expect("failed to build HTTP client");
         Self {
             backend,
-            endpoint: endpoint.trim_end_matches('/').to_string(),
+            endpoint: if backend == Backend::OpenAiResponses
+                && crate::responses::validate_endpoint(endpoint).is_ok()
+            {
+                crate::responses::ENDPOINT.to_string()
+            } else {
+                endpoint.trim_end_matches('/').to_string()
+            },
             model: model.to_string(),
             temperature: 0.1,
             max_tokens: 256,
