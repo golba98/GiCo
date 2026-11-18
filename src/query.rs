@@ -75,6 +75,12 @@ pub(crate) enum Query {
 
     DirectoryName,
     Architecture,
+    UpgradePackages,
+    Journal {
+        severity: String,
+        limit: usize,
+        unit: Option<String>,
+    },
     DiskSpace,
     TreeSize,
     Ranked {
@@ -178,6 +184,33 @@ impl Query {
             .trim_start_matches("just ")
             .trim_start_matches("only ")
             .trim_start_matches("the ");
+        if captures!(
+            r"(?:update|upgrade) (?:all |the )?(?:installed |system )?packages",
+            text
+        )
+        .is_some()
+        {
+            return Some(Self::UpgradePackages);
+        }
+        if let Some(c) = captures!(
+            r"(?:most recent |recent |latest |last )(?:(?P<n>[0-9]+) )?(?:system |journal )?(?P<priority>errors|warnings)(?: (?:from|for) (?:the )?(?P<unit>[a-z0-9@_.-]+))?",
+            body
+        ) {
+            let limit = if let Some(n) = c.name("n") {
+                number(n.as_str())?
+            } else {
+                20
+            };
+            return Some(Self::Journal {
+                severity: if c["priority"].eq_ignore_ascii_case("errors") {
+                    "err".into()
+                } else {
+                    "warning".into()
+                },
+                limit,
+                unit: capture(&c, "unit"),
+            });
+        }
         if captures!(r"(?:machine|system|processor|cpu) architecture", body).is_some() {
             return Some(Self::Architecture);
         }
@@ -534,6 +567,46 @@ impl Query {
             })
         };
         match self {
+            Self::UpgradePackages => {
+                use crate::context::env::on_path;
+                // The distro's own metadata takes precedence when multiple managers coexist.
+                let distro = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+                let family = distro
+                    .lines()
+                    .filter(|l| l.starts_with("ID=") || l.starts_with("ID_LIKE="))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
+                let cmd = if ["fedora", "rhel", "centos"]
+                    .iter()
+                    .any(|id| family.contains(id))
+                    && on_path("dnf")
+                {
+                    "sudo dnf upgrade"
+                } else if ["debian", "ubuntu"].iter().any(|id| family.contains(id))
+                    && on_path("apt-get")
+                {
+                    "sudo apt-get update && sudo apt-get upgrade"
+                } else if family.contains("arch") && on_path("pacman") {
+                    "sudo pacman -Syu"
+                } else if family.contains("suse") && on_path("zypper") {
+                    "sudo zypper update"
+                } else {
+                    return Err("Which system package manager should handle the upgrade?".into());
+                };
+                Ok(cmd.into())
+            }
+            Self::Journal {
+                severity,
+                limit,
+                unit,
+            } => {
+                let mut command = format!("journalctl --no-pager -p {severity} -n {limit}");
+                if let Some(u) = unit {
+                    command.push_str(&format!(" -u {}", shell_quote(u)));
+                }
+                Ok(command)
+            }
             Self::Architecture => Ok("uname -m".into()),
             Self::DirectoryName => Ok("basename -- \"$PWD\"".into()),
             Self::DiskSpace => Ok("df -h .".into()),
