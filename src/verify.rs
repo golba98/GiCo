@@ -1145,34 +1145,93 @@ pub(crate) fn intent_issues_at(request: &str, command: &str, cwd: &Path) -> Vec<
             suggestion: Some("retain the requested path as one operand".into()),
         }];
     }
-    let read_only = matches!(
-        intent,
-        Intent::Explain
-            | Intent::ListDir
-            | Intent::InspectProcess
-            | Intent::InspectPort
-            | Intent::GitLog
-            | Intent::GitDiff
-            | Intent::GitStatus
-            | Intent::MemoryInfo
-            | Intent::DiskUsage
-    ) && ![
-        "save ", "write ", "create ", "replace ", "commit ", "install ", "remove ", "delete ",
-        "move ", "append ", "copy ",
-    ]
-    .iter()
-    .any(|verb| lower.contains(verb));
+    let action = lower
+        .split_whitespace()
+        .find(|w| !matches!(*w, "please" | "could" | "would" | "you"));
+    let reads = matches!(
+        action,
+        Some(
+            "show"
+                | "print"
+                | "emit"
+                | "read"
+                | "count"
+                | "report"
+                | "display"
+                | "find"
+                | "list"
+                | "sort"
+                | "filter"
+                | "collapse"
+                | "reverse"
+                | "compare"
+                | "extract"
+        )
+    );
+    let read_only = (reads
+        || matches!(
+            intent,
+            Intent::Explain
+                | Intent::ListDir
+                | Intent::InspectProcess
+                | Intent::InspectPort
+                | Intent::GitLog
+                | Intent::GitDiff
+                | Intent::GitStatus
+                | Intent::MemoryInfo
+                | Intent::DiskUsage
+        ))
+        && ![
+            "save ",
+            "write ",
+            "create ",
+            "replace ",
+            "commit ",
+            "install ",
+            "remove ",
+            "delete ",
+            "move ",
+            "append ",
+            "copy ",
+            "overwrite ",
+            " in place",
+            " in-place",
+            " into ",
+            " to a file",
+        ]
+        .iter()
+        .any(|verb| lower.contains(verb));
     if read_only {
         let commands = lex(command).and_then(|t| parse(&t)).unwrap_or_default();
         let writes = commands.iter().any(|c| {
-            c.redirects
-                .iter()
-                .any(|(op, dest)| op.contains('>') && dest != "/dev/null")
+            let program = c
+                .words
+                .first()
+                .and_then(|p| Path::new(p).file_name())
+                .and_then(|s| s.to_str());
+            let in_place = match program {
+                Some("sed" | "perl") => c.words.iter().skip(1).any(|w| {
+                    w.starts_with("--in-place")
+                        || w.starts_with('-') && !w.starts_with("--") && w.contains('i')
+                }),
+                Some("sort") => c
+                    .words
+                    .iter()
+                    .skip(1)
+                    .any(|w| w.starts_with("-o") || w.starts_with("--output")),
+                Some("find") => c.words.iter().any(|w| w == "-delete"),
+                _ => false,
+            };
+            in_place
+                || c.redirects
+                    .iter()
+                    .any(|(op, dest)| op.contains('>') && dest != "/dev/null")
                 || c.words.first().is_some_and(|p| {
                     matches!(
                         Path::new(p).file_name().and_then(|n| n.to_str()),
                         Some(
                             "rm" | "mv"
+                                | "cp"
                                 | "touch"
                                 | "tee"
                                 | "chmod"

@@ -44,6 +44,8 @@ pub(crate) enum Transform {
         output: MatchOutput,
     },
     DistinctCount,
+    AdjacentUnique,
+    JsonIndex(usize),
     SortField {
         index: usize,
         separator: char,
@@ -296,6 +298,18 @@ impl Query {
                 destination: capture(c, "dest").map(|path| Destination { path, overwrite }),
             })
         };
+        if let Some(c) = captures!(
+            r"(?:collapse|deduplicate|remove) (?:repeated |duplicate )?(?:adjacent|consecutive) (?:duplicates|rows|lines)(?: in| from) (?P<file>[^ ]+)(?: without (?:reordering|rearranging)(?: anything)?)?",
+            body
+        ) {
+            return stream(&c, Transform::AdjacentUnique);
+        }
+        if let Some(c) = captures!(
+            r"(?:value of (?:the )?)?(?P<n>[^ ]+) (?:element|item) (?:of|in) (?:the )?(?:json )?array (?:in|from) (?P<file>[^ ]+)",
+            body
+        ) {
+            return stream(&c, Transform::JsonIndex(number(&c["n"])? - 1));
+        }
         if let Some(c) = captures!(
             r"sort (?P<file>[^ ]+)(?: (?P<mode>numerically|lexically))? by (?:the )?(?P<n>[^ ]+) (?P<sep>tab|comma|colon)-separated (?:field|column)(?: (?:in )?(?P<dir>descending|ascending)(?: order)?)?",
             body
@@ -690,6 +704,8 @@ impl Query {
                 }
                 let f = path(input);
                 let mut cmd = match operation {
+                    Transform::AdjacentUnique => format!("uniq -- {f}"),
+                    Transform::JsonIndex(index) => format!("jq -r '.[{index}]' -- {f}"),
                     Transform::Contents => format!("cat -- {f}"),
                     Transform::Extension => format!("basename -- {f} | awk -F . '{{print $NF}}'"),
                     Transform::JsonKey(key) => {

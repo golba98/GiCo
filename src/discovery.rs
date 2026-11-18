@@ -230,8 +230,10 @@ pub fn interpret(
         .unwrap_or("")
         .to_ascii_lowercase();
     let asks_about_evidence = allow_answer
-        || matches!(question_word.as_str(), "which" | "when" | "who" | "how")
-            && request.trim_end().ends_with('?');
+        || matches!(
+            question_word.as_str(),
+            "what" | "where" | "which" | "when" | "who" | "how"
+        ) && request.trim_end().ends_with('?');
     let document = asks_about_evidence
         .then(|| {
             crate::constraints::requested_files(request)

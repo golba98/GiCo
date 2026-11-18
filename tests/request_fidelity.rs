@@ -145,3 +145,28 @@ fn ordinary_words_do_not_imply_project_operations() {
         ));
     }
 }
+
+#[test]
+fn printing_or_filtering_cannot_replace_its_input() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("sensor"), "i\ni\n").unwrap();
+    for cmd in [
+        "sed -i s/i/x/ sensor",
+        "sort -o sensor sensor",
+        "cp sensor shadow",
+        "awk '1' sensor > shadow && mv shadow sensor",
+    ] {
+        let c = candidate(
+            root.path(),
+            "display each distinct reading in sensor",
+            Some(cmd),
+        );
+        assert_eq!(c.report.verdict(), Verdict::Blocked, "{cmd}");
+    }
+    let c = candidate(
+        root.path(),
+        "collapse repeated adjacent rows in sensor without rearranging anything",
+        None,
+    );
+    assert_eq!(c.command, "uniq -- sensor");
+}
