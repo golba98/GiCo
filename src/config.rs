@@ -21,6 +21,8 @@ pub struct Config {
     pub temperature: f32,
     pub preload: bool,
     pub idle_seconds: u32,
+    #[serde(default)]
+    pub workspace_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -44,6 +46,7 @@ impl Default for Config {
             temperature: 0.1,
             preload: true,
             idle_seconds: 300,
+            workspace_roots: Vec::new(),
         }
     }
 }

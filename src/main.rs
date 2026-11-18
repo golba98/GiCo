@@ -146,6 +146,8 @@ enum Cmd {
     Preload,
     /// Print the opt-in zsh integration snippet (eval "$(gico init-zsh)").
     InitZsh,
+    #[command(hide = true)]
+    NavigationComplete,
 }
 
 #[derive(Subcommand)]
@@ -159,6 +161,7 @@ const ZSH_HOOK_SNIPPET: &str = r#"# GiCo shell integration (opt-in). Add to ~/.z
 #   eval "$(gico init-zsh)"
 if [[ -o interactive && -t 0 && -t 1 && -n "$TTY" && "${GICO_TERMINAL:-}" != "$TTY" ]]; then
   export GICO_TERMINAL="$TTY"
+  export GICO_SESSION="$$-$RANDOM-$RANDOM"
   command gico preload </dev/null >/dev/null 2>&1 &!
 fi
 gico() {
@@ -166,10 +169,12 @@ gico() {
   local handoff target
   handoff=$(command mktemp -d -- "${TMPDIR:-/tmp}/gico-zsh.XXXXXXXX") || return
   {
-    command gico --cd-hook-dir "$handoff" "$@" || return $?
+    GICO_PREVIOUS_DIR="$OLDPWD" command gico --cd-hook-dir "$handoff" "$@" || return $?
     if [[ -f "$handoff/target" ]]; then
       IFS= read -r -d '' target < "$handoff/target" || return 2
       builtin cd -- "$target" || return $?
+      command gico navigation-complete >/dev/null 2>&1
+      return 0
     fi
   } always {
     command rm -f -- "$handoff/target"
@@ -180,6 +185,12 @@ gico() {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Cmd::NavigationComplete)) {
+        if let Ok(cwd) = std::env::current_dir() {
+            gico::context::registry::remember(&cwd);
+        }
+        return ExitCode::SUCCESS;
+    }
     // Allow shell startup and version discovery even if the config needs repair.
     if matches!(cli.command, Some(Cmd::InitZsh)) {
         let cloud = gico::config::path()
@@ -278,6 +289,7 @@ fn main() -> ExitCode {
     let engine = ContextEngine::new(engine_cfg);
 
     match cli.command {
+        Some(Cmd::NavigationComplete) => unreachable!("handled before config"),
         Some(Cmd::Usage) => match gico::usage::read() {
             Ok(t) => {
                 println!(
@@ -686,9 +698,8 @@ fn run_pipeline(generator: &Generator<'_>, request: &str, harness: &mut Harness)
             drop(guard);
             let Ok(Some(answer)) = answer else { return 130 };
             let answer = answer.trim();
-            let explicit = PathBuf::from(answer);
-            if explicit.is_absolute() && explicit.is_dir() {
-                Some(explicit)
+            if let Some(chosen) = gico::context::registry::choose_project(&question, answer) {
+                Some(chosen)
             } else {
                 match gico::context::registry::project_for(&cwd, &format!("go to {answer}")) {
                     Ok(Some(path)) => Some(path),
@@ -702,7 +713,7 @@ fn run_pipeline(generator: &Generator<'_>, request: &str, harness: &mut Harness)
             }
         }
     };
-    let nav = gico::intent::navigation_destination(request).is_some();
+    let nav = gico::intent::classify_str(request) == gico::intent::Intent::NavigateDir;
     let workdir = if nav {
         &cwd
     } else {
@@ -761,6 +772,7 @@ fn run_pipeline(generator: &Generator<'_>, request: &str, harness: &mut Harness)
         );
     }
     let mut prepared = if let Some(target) = selected.as_ref().filter(|_| nav) {
+        harness.record(OpKind::Plan, "deterministic navigation", OpOutcome::Ok);
         Preparation::Candidate(pipeline::verify_candidate(
             harness,
             &raw,
@@ -901,7 +913,8 @@ fn interact_request(
     };
     let cancel = harness.cancel_token();
     let mut runtime_failures = 0;
-    let mut last_failure = None;
+    let mut last_failure: Option<String> = None;
+    let mut rejected_runs: Vec<pipeline::Candidate> = Vec::new();
     loop {
         if cancel.is_cancelled() {
             harness.record(OpKind::Approve, &candidate.command, OpOutcome::Cancelled);
@@ -925,7 +938,11 @@ fn interact_request(
         };
         match action {
             interact::Action::Run => {
-                if candidate.report.verdict() == Verdict::Blocked {
+                if candidate.report.verdict() == Verdict::Blocked
+                    || rejected_runs.iter().any(|rejected| {
+                        rejected.command == candidate.command && rejected.same_evidence(&candidate)
+                    })
+                {
                     harness.record(
                         OpKind::Approve,
                         &candidate.command,
@@ -974,11 +991,6 @@ fn interact_request(
                 let elapsed = started.elapsed().as_millis();
                 match outcome {
                     Ok(Dispatch::Navigation) => {
-                        if let Some(target) =
-                            verify::navigation_target(&candidate.command, &raw.environment.cwd)
-                        {
-                            gico::context::registry::remember(&target);
-                        }
                         harness.record_ms(
                             OpKind::Navigate,
                             "handed off to the parent shell",
@@ -1008,10 +1020,17 @@ fn interact_request(
                             );
                             return 130;
                         } else if outcome.success {
+                            let assessed = match outcome.readiness {
+                                Some((false, reason)) => {
+                                    eprintln!("gico: {reason}");
+                                    OpOutcome::Interrupted(reason)
+                                }
+                                _ => OpOutcome::Ok,
+                            };
                             harness.record_ms(
                                 OpKind::Execute,
                                 &candidate.command,
-                                OpOutcome::Ok,
+                                assessed,
                                 elapsed,
                             );
                             return 0;
@@ -1059,9 +1078,72 @@ fn interact_request(
                     }
                 }
                 runtime_failures += 1;
-                if runtime_failures >= 3 {
-                    eprintln!("gico: command failed after {runtime_failures} approved attempts");
-                    return last_exit.unwrap_or(2);
+                let failure = last_failure.as_deref().unwrap_or("command failed");
+                let transient = [
+                    "resource temporarily unavailable",
+                    "temporarily busy",
+                    "try again",
+                ]
+                .iter()
+                .any(|word| failure.to_lowercase().contains(word));
+                if transient && runtime_failures < 3 {
+                    candidate.note =
+                        Some("Temporary failure · Enter retries the same command.".into());
+                } else {
+                    let previous = candidate.command.clone();
+                    rejected_runs.push(candidate);
+                    raw = match scan(generator.engine, &raw.environment.cwd, harness) {
+                        Ok(raw) => raw,
+                        Err(error) => return io_error("refresh evidence after failure", error),
+                    };
+                    let mut corrected = None;
+                    if runtime_failures <= 2 {
+                        let safe_feedback = failure
+                            .lines()
+                            .filter(|line| {
+                                !["secret", "bearer ", "password", "api_key", "sk-proj-"]
+                                    .iter()
+                                    .any(|word| line.to_ascii_lowercase().contains(word))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let prepared = pipeline::prepare(harness, &raw, request, |_, h| {
+                            generator.generate(&raw, request, Some((&previous, &safe_feedback)), h)
+                        });
+                        match prepared {
+                            Preparation::Candidate(new)
+                                if new.report.verdict() != Verdict::Blocked
+                                    && !rejected_runs
+                                        .iter()
+                                        .any(|old| old.command == new.command) =>
+                            {
+                                corrected = Some(new)
+                            }
+                            Preparation::Cancelled => return 130,
+                            _ => {}
+                        }
+                    }
+                    candidate = if let Some(mut corrected) = corrected {
+                        corrected.note =
+                            Some("Corrected after failure · review before running.".into());
+                        corrected
+                    } else {
+                        let mut blocked = pipeline::verify_candidate(
+                            harness,
+                            &raw,
+                            request,
+                            previous,
+                            Some(
+                                format!("Previous run {} · No verified correction. Use r refine, e edit, or c cancel.", failure.split(". stderr:").next().unwrap_or("failed")),
+                            ),
+                        );
+                        blocked.report.issues.push(verify::Issue {
+                            severity: verify::Severity::Error,
+                            message: "previous run failed with these prerequisites".into(),
+                            suggestion: None,
+                        });
+                        blocked
+                    };
                 }
                 raw_guard = match interact::enable_raw_mode() {
                     Ok(guard) => guard,

@@ -36,14 +36,35 @@ pub fn plan(raw: &RawScan, request: &str) -> Option<Plan> {
         });
     }
     let intent = intent::classify(request, raw);
+    use crate::launch::{Request, Resolution};
+    match crate::launch::resolve(raw, &Request::parse(request, raw)) {
+        Resolution::Resolved(launch)
+            if crate::constraints::shortcut_fits(raw, intent, request, &launch.command()) =>
+        {
+            return Some(Plan {
+                command: launch.command(),
+                note: launch.note,
+            });
+        }
+        Resolution::NeedUserChoice(choices) => {
+            return Some(Plan {
+                command: String::new(),
+                note: Some(crate::launch::choice_prompt(&choices)),
+            })
+        }
+        Resolution::Unavailable(note) => {
+            return Some(Plan {
+                command: String::new(),
+                note: Some(note),
+            })
+        }
+        Resolution::Resolved(_) | Resolution::NeedEvidence => {}
+    }
     if matches!(intent, Intent::Run | Intent::BuildAndRun)
         && requested_target_kind(request).is_some()
         && raw.project.as_ref().and_then(|p| p.build_system.as_deref()) != Some("CMake")
     {
-        return Some(Plan {
-            command: String::new(),
-            note: Some("No verified matching executable was found in this project.".into()),
-        });
+        return None;
     }
     let plan = match intent {
         Intent::Build | Intent::Run | Intent::BuildAndRun | Intent::Test | Intent::Clean => {
@@ -309,273 +330,21 @@ fn history_command(words: &[&str], cwd: &Path) -> Option<String> {
 // approved cd is applied in the user's own shell.
 // ---------------------------------------------------------------------------
 
-const NAV_STOPWORDS: &[&str] = &[
-    "my",
-    "the",
-    "a",
-    "an",
-    "to",
-    "me",
-    "into",
-    "in",
-    "directory",
-    "dir",
-    "folder",
-    "project",
-    "projects",
-    "development",
-    "dev",
-    "code",
-    "work",
-    "workspace",
-    "repo",
-    "repos",
-    "please",
-    "for",
-    "and",
-    "of",
-    "change",
-    "changed",
-    "go",
-    "goes",
-    "navigate",
-    "switch",
-    "take",
-    "open",
-    "browse",
-    "cd",
-];
-
-/// Directories that are never useful navigation targets (caches, toolchains,
-/// package stores).
-const NAV_SKIP_DIRS: &[&str] = &[
-    ".cache",
-    ".npm",
-    ".cargo",
-    ".rustup",
-    ".local",
-    ".config",
-    ".git",
-    "node_modules",
-    "miniforge3",
-    "anaconda3",
-    "target",
-    "__pycache__",
-    ".venv",
-    "venv",
-];
-
-/// Project-marker files that identify what a directory is used for.
-const MARKER_FILES: &[(&str, &str)] = &[
-    ("rust", "Cargo.toml"),
-    ("python", "pyproject.toml"),
-    ("python", "requirements.txt"),
-    ("javascript", "package.json"),
-    ("typescript", "package.json"),
-    ("node", "package.json"),
-    ("go", "go.mod"),
-    ("c++", "CMakeLists.txt"),
-    ("cpp", "CMakeLists.txt"),
-    ("java", "pom.xml"),
-    ("java", "build.gradle"),
-];
-
-fn resolve_directory(request: &str, cwd: &Path) -> Result<std::path::PathBuf, &'static str> {
-    let home = std::env::var_os("HOME").ok_or("home directory is unavailable")?;
-    let home = std::path::PathBuf::from(home);
-    let destination = intent::navigation_destination(request).or_else(|| {
-        request
-            .split_once(" to ")
-            .map(|(_, destination)| destination)
-    });
-    if let Some(destination) = destination {
-        if intent::is_home_destination(destination) {
-            return home
-                .is_absolute()
-                .then(|| home.canonicalize().ok())
-                .flatten()
-                .filter(|path| path.is_dir())
-                .ok_or("home directory is unavailable");
-        }
-        let destination = destination.trim().trim_matches(['\'', '"']);
-        let explicit = destination.starts_with('/')
-            || destination.starts_with('.')
-            || destination.starts_with("~/");
-        if explicit {
-            let path = if let Some(relative) = destination.strip_prefix("~/") {
-                home.join(relative)
-            } else {
-                cwd.join(destination)
-            };
-            return path
-                .canonicalize()
-                .ok()
-                .filter(|path| path.is_dir())
-                .ok_or("could not find the requested directory");
-        }
-    }
-    let lower = destination.unwrap_or(request).to_lowercase();
-    // “to where <name> is” identifies a named directory. A partial match
-    // (for example, a sibling project sharing two words) is insufficient.
-    let named = lower
-        .trim_end_matches(['.', '?', '!'])
-        .trim_end()
-        .strip_prefix("where ")
-        .and_then(|end| end.strip_suffix(" is"))
-        .map(|name| name.trim().trim_matches(['\'', '"']));
-    let tokens: Vec<_> = directory_words(&lower)
-        .filter(|word| !word.is_empty() && !NAV_STOPWORDS.contains(word))
-        .collect();
-    if tokens.is_empty() {
-        return Err("could not find a directory matching the request");
-    }
-
-    let mut queue = std::collections::VecDeque::from([(cwd.to_owned(), 0), (home, 0)]);
-    let mut visited = std::collections::HashSet::new();
-    let mut remaining = 20_000;
-    let mut best = None;
-    let mut tied = false;
-    while let Some((dir, depth)) = queue.pop_front() {
-        if depth == 3 || remaining == 0 || !visited.insert(dir.clone()) {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        let mut children = Vec::new();
-        for entry in entries.take(remaining) {
-            remaining -= 1;
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name.starts_with('.')
-                || NAV_SKIP_DIRS.contains(&name)
-                || crate::context::fs::is_sensitive(name, true)
-                || name.chars().any(char::is_control)
-                || !entry.file_type().is_ok_and(|kind| kind.is_dir())
-            {
-                continue;
-            }
-            let path = entry.path();
-            let lower = name.to_lowercase();
-            let rank = match named {
-                Some(expected) => (lower == expected).then_some(0),
-                None => directory_rank(&path, &lower, &tokens),
-            };
-            if let Some(rank) = rank {
-                match best.as_ref() {
-                    Some((current, previous)) if rank == *current => tied |= previous != &path,
-                    Some((current, _)) if rank < *current => {}
-                    _ => {
-                        best = Some((rank, path.clone()));
-                        tied = false;
-                    }
-                }
-            }
-            children.push(path);
-        }
-        children.sort();
-        queue.extend(children.into_iter().map(|path| (path, depth + 1)));
-    }
-    if tied || remaining == 0 {
-        return Err(
-            "directory evidence is ambiguous or the search limit was reached; specify a path",
-        );
-    }
-    let (_, path) = best.ok_or("could not find a directory matching the request")?;
-    Ok(cmake::relocated_source(&path)?.unwrap_or(path))
-}
-
-fn directory_words(name: &str) -> impl Iterator<Item = &str> + Clone {
-    name.split(|c: char| !c.is_alphanumeric() && c != '+')
-        .filter(|word| !word.is_empty())
-}
-
-fn canonical_language(word: &str) -> &str {
-    match word {
-        "cpp" => "c++",
-        _ => word,
-    }
-}
-
-fn directory_rank(path: &Path, name: &str, tokens: &[&str]) -> Option<usize> {
-    let words = directory_words(name).map(canonical_language);
-    let mut score = 0;
-    for &token in tokens {
-        let token = canonical_language(token);
-        if words.clone().any(|word| word == token) {
-            score += 3;
-            continue;
-        }
-        let language = MARKER_FILES.iter().any(|&(lang, _)| lang == token);
-        if language {
-            // A language can qualify a project name through its containing
-            // folder or a build file. A language-only request needs a named folder.
-            if tokens.len() == 1 {
-                return None;
-            }
-            let parent = path.parent()?.file_name()?.to_str()?.to_lowercase();
-            if directory_words(&parent)
-                .map(canonical_language)
-                .any(|word| word == token)
-                || MARKER_FILES
-                    .iter()
-                    .any(|&(lang, file)| lang == token && path.join(file).is_file())
-            {
-                continue;
-            }
-            return None;
-        }
-        let quality = words
-            .clone()
-            .filter_map(|word| {
-                if token.len() >= 3 && word.starts_with(token) {
-                    return Some(2);
-                }
-                (token.len() >= 4
-                    && word.len() >= 4
-                    && word.len().abs_diff(token.len()) <= 1
-                    && strsim::osa_distance(token, word) <= 1)
-                    .then_some(1)
-            })
-            .max()?;
-        score += quality;
-    }
-    if let [token] = tokens {
-        let marker = MARKER_FILES.iter().any(|(lang, file)| {
-            lang == token && (path.join(file).is_file() || dir_has_child_marker(path, file))
-        });
-        score += usize::from(marker);
-    }
-    Some(score)
-}
-
-fn dir_has_child_marker(dir: &Path, marker: &str) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries.take(50).flatten().any(|entry| {
-            entry.file_type().is_ok_and(|kind| kind.is_dir()) && entry.path().join(marker).is_file()
-        })
-    })
-}
-
 fn navigate_plan(raw: &RawScan, request: &str) -> Option<Plan> {
-    let (command, note) = match resolve_directory(request, &raw.environment.cwd) {
-        Ok(path) => match path
-            .to_str()
-            .filter(|path| !path.chars().any(char::is_control))
-        {
-            Some(path) => (format!("cd {}", shell_quote(path)), None),
-            None => (
-                String::new(),
-                Some("the directory cannot be safely represented".to_owned()),
-            ),
-        },
-        Err(message) => (String::new(), Some(message.to_owned())),
-    };
+    let (command, note) =
+        match crate::context::registry::resolve_directory(request, &raw.environment.cwd) {
+            Ok(path) => match path
+                .to_str()
+                .filter(|path| !path.chars().any(char::is_control))
+            {
+                Some(path) => (format!("cd {}", shell_quote(path)), None),
+                None => (
+                    String::new(),
+                    Some("the directory cannot be safely represented".to_owned()),
+                ),
+            },
+            Err(message) => (String::new(), Some(message.to_owned())),
+        };
     Some(Plan { command, note })
 }
 
@@ -612,7 +381,7 @@ fn join(steps: &[String]) -> String {
     steps.join(" && ")
 }
 
-fn cmake_plan(raw: &RawScan, request: &str, intent: Intent) -> Option<Plan> {
+pub(crate) fn cmake_plan(raw: &RawScan, request: &str, intent: Intent) -> Option<Plan> {
     let root = raw.environment.cwd.clone();
     let trees = cmake::discover_build_trees(&root, &raw.cmake_build_dirs);
     let (default_dir, configured) = cmake::select_build_dir(&root, &trees);
@@ -892,64 +661,12 @@ fn make_plan(raw: &RawScan, intent: Intent) -> Option<Plan> {
     }
 }
 
-fn cargo_plan(raw: &RawScan, intent: Intent, request: &str) -> Option<Plan> {
+fn cargo_plan(_: &RawScan, intent: Intent, _: &str) -> Option<Plan> {
     match intent {
         Intent::Build => Some(Plan {
             command: "cargo build".into(),
             note: None,
         }),
-        Intent::BuildAndRun | Intent::Run => {
-            let bins = crate::context::cargo::binaries(raw);
-            let words = request
-                .split(|c: char| !c.is_alphanumeric() && !matches!(c, '-' | '_'))
-                .collect::<Vec<_>>();
-            let named: Vec<_> = bins
-                .iter()
-                .filter(|b| {
-                    words.iter().any(|w| {
-                        b.name.eq_ignore_ascii_case(w) || b.package.eq_ignore_ascii_case(w)
-                    })
-                })
-                .collect();
-            let bin = match named.as_slice() {
-                [one] => Some(*one),
-                [] if bins.len() == 1 => bins.first(),
-                _ => None,
-            };
-            let Some(bin) = bin else {
-                return Some(Plan {
-                    command: String::new(),
-                    note: Some(if bins.is_empty() {
-                        "No verified Cargo binary target.".into()
-                    } else {
-                        format!(
-                            "Which Cargo binary? {}",
-                            bins.iter()
-                                .map(|b| format!("{}/{}", b.package, b.name))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    }),
-                });
-            };
-            let flags = if bins.len() == 1 && bin.manifest == Path::new("Cargo.toml") {
-                String::new()
-            } else {
-                format!(
-                    " -p {} --bin {}",
-                    shell_quote(&bin.package),
-                    shell_quote(&bin.name)
-                )
-            };
-            let mut cmd = format!("cargo run{flags}");
-            if intent == Intent::BuildAndRun {
-                cmd = format!("cargo build{flags} && {cmd}");
-            }
-            Some(Plan {
-                command: cmd,
-                note: None,
-            })
-        }
         Intent::Test => Some(Plan {
             command: "cargo test".to_string(),
             note: None,

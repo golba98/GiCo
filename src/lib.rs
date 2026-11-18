@@ -15,6 +15,7 @@ pub mod discovery;
 pub mod harness;
 pub mod intent;
 pub mod interact;
+pub mod launch;
 pub mod lifecycle;
 pub mod llm;
 pub mod plan;
@@ -23,6 +24,7 @@ pub mod shell;
 pub mod ui;
 pub mod verify;
 
+mod launch_adapters;
 mod query;
 
 pub mod auth;

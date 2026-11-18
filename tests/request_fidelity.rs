@@ -223,3 +223,109 @@ fn character_count_is_independent_of_the_calling_shell_locale() {
         assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), expected);
     }
 }
+
+#[test]
+fn virtual_workspace_launches_the_verified_gui_subcommand_with_features() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for member in ["screen", "worker"] {
+        fs::create_dir_all(root.join(format!("packages/{member}/src"))).unwrap();
+    }
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"packages/*\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("README.md"),
+        "```sh\ncargo run --release --bin canvas -- draw\n```\n",
+    )
+    .unwrap();
+    fs::write(root.join("packages/screen/Cargo.toml"), "[package]\nname = 'sketch'\nversion = '0.1.0'\nautobins = false\n[features]\nvisual = []\n[[bin]]\nname = 'canvas'\npath = 'src/main.rs'\nrequired-features = ['visual']\n").unwrap();
+    fs::write(root.join("packages/screen/src/main.rs"), "enum Command {\n/// Open the graphical window.\nDraw(Options),\n}\nfn main() { match cli() { Command::Draw(args) => show(args) } }").unwrap();
+    fs::write(
+        root.join("packages/worker/Cargo.toml"),
+        "[package]\nname = 'daemon'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    fs::write(root.join("packages/worker/src/main.rs"), "fn main() {}").unwrap();
+    let request = "I'd like to see the GUI in this Rust build";
+    let preview = candidate(root, request, None);
+    assert_ne!(preview.report.verdict(), Verdict::Blocked);
+    assert_eq!(
+        preview.command,
+        "cargo run --release --bin canvas --features visual -- draw"
+    );
+    for wrong in ["cargo run --release", "cargo run --release --bin daemon"] {
+        assert_eq!(
+            candidate(root, request, Some(wrong)).report.verdict(),
+            Verdict::Blocked
+        );
+    }
+    let raw = ContextEngine::new(Default::default()).scan(root).unwrap();
+    fs::write(root.join("packages/screen/src/main.rs"), "fn main() {}").unwrap();
+    assert!(pipeline::authorize(
+        &mut Harness::new(4),
+        &raw,
+        request,
+        &preview,
+        Some(&preview.command)
+    )
+    .is_err());
+}
+
+#[test]
+fn genuine_target_ambiguity_accepts_a_number_without_guessing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='scope'\nversion='0.1.0'",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src/bin")).unwrap();
+    fs::write(root.join("src/bin/first.rs"), "fn main(){}").unwrap();
+    fs::write(root.join("src/bin/second.rs"), "fn main(){}").unwrap();
+    let raw = ContextEngine::new(Default::default()).scan(root).unwrap();
+    let response = pipeline::prepare(
+        &mut Harness::new(4),
+        &raw,
+        "run this Rust program",
+        |_, _| panic!("known options"),
+    );
+    assert!(
+        matches!(response, pipeline::Preparation::Clarify(s) if s.contains("1 scope/first") && s.contains("2 scope/second"))
+    );
+    assert_eq!(
+        candidate(root, "run this Rust program\nClarification: 2", None).command,
+        "cargo run --bin second"
+    );
+}
+
+#[test]
+fn navigation_combines_the_project_name_and_documented_purpose() {
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("Development/Signal Emulator");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\nmembers=[]").unwrap();
+    fs::write(
+        project.join("README.md"),
+        "# Signal Emulator\n\nInspect a handheld calculator on the desktop.\n",
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_gico"))
+        .args([
+            "--backend",
+            "ollama",
+            "--no-cache",
+            "--proposal-json",
+            "take me to that calculator emulator",
+        ])
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .current_dir(std::env::temp_dir())
+        .output()
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(output["command"], format!("cd '{}'", project.display()));
+}

@@ -1,6 +1,6 @@
 //! Private project maps. File identity distinguishes worktrees and survives a rename on the same filesystem.
 use super::{cmake, fs, RawScan};
-use crate::config;
+use crate::{config, intent};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -18,6 +18,12 @@ const MANIFESTS: &[&str] = &[
     "pyproject.toml",
     "requirements.txt",
     "go.mod",
+    "go.work",
+    "Justfile",
+    "justfile",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
     "Makefile",
     ".git",
 ];
@@ -75,6 +81,8 @@ pub struct Preferences {
     pub purpose: Option<String>,
     #[serde(default)]
     pub roles: BTreeMap<String, String>,
+    #[serde(flatten)]
+    additional: BTreeMap<String, Value>,
 }
 
 type Locations = BTreeMap<String, PathBuf>;
@@ -124,7 +132,7 @@ fn signature(raw: &RawScan) -> String {
 
 fn checked_record(path: &Path, signature: &str) -> Option<Value> {
     let record: Value = read(path).ok()?;
-    (record["version"] == 1
+    (record["version"] == 2
         && record["signature"].as_str() == Some(signature)
         && record["facts"].is_object())
     .then_some(record)
@@ -151,7 +159,7 @@ pub fn observe(raw: &RawScan) -> io::Result<()> {
     }
     write(
         &record,
-        &json!({"version":1,"observed_at":now(),"root":root,"signature":signature,"facts":facts(raw)}),
+        &json!({"version":2,"observed_at":now(),"root":root,"signature":signature,"facts":facts(raw)}),
     )
 }
 
@@ -161,30 +169,7 @@ fn facts(raw: &RawScan) -> Value {
         matches!(e.name.as_str(),"main.rs"|"main.py"|"__main__.py"|"main.cpp"|"index.ts"|"index.js"|"README.md")))
         .take(32).map(|e|json!({"path":e.path,"role":if MANIFESTS.contains(&e.name.as_str()) {"manifest"} else if e.name=="README.md" {"documentation"} else {"entrypoint candidate"},
             "mtime":root.join(&e.path).metadata().ok().map(|m|m.mtime()),"bytes":e.size})).collect();
-    let mut purpose = None;
-    for (file, section) in [
-        ("Cargo.toml", "package"),
-        ("pyproject.toml", "project"),
-        ("package.json", ""),
-    ] {
-        if let Ok(text) = fs::read_text(&root.join(file), 65536) {
-            purpose = if section.is_empty() {
-                serde_json::from_str::<Value>(&text)
-                    .ok()
-                    .and_then(|v| v["description"].as_str().map(str::to_owned))
-            } else {
-                toml::from_str::<toml::Value>(&text).ok().and_then(|v| {
-                    v.get(section)?
-                        .get("description")?
-                        .as_str()
-                        .map(str::to_owned)
-                })
-            };
-            if purpose.is_some() {
-                break;
-            }
-        }
-    }
+    let purpose = project_purpose(root);
     let mut entries = Vec::new();
     if let Ok(text) = fs::read_text(&root.join("package.json"), 65536) {
         if let Ok(pkg) = serde_json::from_str::<Value>(&text) {
@@ -232,6 +217,9 @@ fn facts(raw: &RawScan) -> Value {
             ("build", "build this project"),
             ("test", "run the tests"),
             ("run", "run this project"),
+            ("gui", "launch the GUI"),
+            ("service", "start the service"),
+            ("web", "open the web preview"),
         ] {
             if let Some(plan) = crate::plan::plan(raw, request).filter(|p| !p.command.is_empty()) {
                 recipes.insert(action,json!({"command":plan.command,"cwd":".","evidence":p.config_files,"note":plan.note}));
@@ -239,7 +227,7 @@ fn facts(raw: &RawScan) -> Value {
         }
     }
     json!({"purpose":purpose.map(|s|s.chars().take(200).collect::<String>()),"evidence":sources,"project":raw.project,
-        "entrypoints":entries,"targets":targets,"recipes":recipes,"working_directory":".",
+        "entrypoints":entries,"targets":targets,"recipes":recipes,"working_directory":".","scan_status":{"entries":raw.entries.len(),"discovered":raw.total_discovered},
         "prerequisites":{"build_system":raw.project.as_ref().and_then(|p|p.build_system.as_deref()),"gui_requires_display":targets.iter().any(|t|t.kind==cmake::TargetKind::Gui)},
         "build_trees":cmake::discover_build_trees(root,&raw.cmake_build_dirs).iter().map(|t|json!({"dir":t.dir,"valid":t.valid})).collect::<Vec<_>>()})
 }
@@ -266,7 +254,10 @@ pub fn evidence(raw: &RawScan) -> Value {
     let facts = stored
         .map(|mut record| record["facts"].take())
         .unwrap_or_else(|| facts(raw));
-    json!({"observations":facts,"preferences":prefs.ok()})
+    let preferences = prefs
+        .ok()
+        .map(|p| json!({"aliases":p.aliases,"roles":p.roles,"purpose":p.purpose}));
+    json!({"observations":facts,"preferences":preferences})
 }
 
 pub fn alias(root: &Path, alias: &str) -> io::Result<()> {
@@ -296,8 +287,13 @@ pub fn alias(root: &Path, alias: &str) -> io::Result<()> {
 
 fn session_path() -> Option<PathBuf> {
     let term = std::env::var("GICO_TERMINAL").ok()?;
-    let name = term.strip_prefix("/dev/")?;
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
+    let session = std::env::var("GICO_SESSION").ok();
+    let name = session.as_deref().or_else(|| term.strip_prefix("/dev/"))?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-'))
+    {
         return None;
     }
     Some(
@@ -342,45 +338,186 @@ fn contains_name(request: &str, name: &str) -> bool {
     !name.is_empty() && request.contains(&format!(" {name} "))
 }
 
-/// Search only known workspace locations. Never traverse hidden directories or symlinks.
-fn workspace_projects() -> Vec<PathBuf> {
-    let Ok(home) = config::home() else {
-        return vec![];
-    };
-    let start = home.join("Development");
-    if !start.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-        return vec![];
+/// A bounded shared inventory for both project tasks and directory navigation.
+fn workspace_places(cwd: &Path) -> (Vec<PathBuf>, bool) {
+    let home = config::home().ok();
+    let mut roots = Vec::new();
+    if let Some(home) = &home {
+        roots.push((home.join("Development"), 0));
     }
-    let mut todo = vec![(start, 0)];
-    let mut result = Vec::new();
-    let mut remaining = 2048;
-    while let Some((p, depth)) = todo.pop() {
-        if remaining == 0 {
-            break;
+    if let Ok(path) = config::path() {
+        if let Ok(config) = config::Config::load(&path) {
+            roots.extend(
+                config
+                    .workspace_roots
+                    .into_iter()
+                    .filter(|p| p.is_absolute())
+                    .take(12)
+                    .map(|p| (p, 0)),
+            );
         }
-        if depth > 0 && manifest(&p) {
-            result.push(p);
+    }
+    // A broad system working directory such as /tmp is not a workspace root.
+    // Its entries must not consume the configured workspace's search budget.
+    let scoped_cwd = home.as_ref().is_some_and(|home| cwd.starts_with(home)) || manifest(cwd);
+    roots.push((cwd.to_owned(), if scoped_cwd { 0 } else { 3 }));
+    if let Some(home) = &home {
+        roots.extend(
+            home.read_dir()
+                .into_iter()
+                .flatten()
+                .take(128)
+                .flatten()
+                .filter(|e| {
+                    e.file_type().is_ok_and(|m| m.is_dir())
+                        && !e.file_name().to_string_lossy().starts_with('.')
+                })
+                .map(|e| e.path())
+                .take(32)
+                .map(|p| (p, 3)),
+        );
+    }
+    let mut pending: std::collections::VecDeque<_> = roots
+        .into_iter()
+        .filter_map(|(root, depth)| root.canonicalize().ok().map(|path| (path, depth)))
+        .collect();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut places = Vec::new();
+    let mut budget = 4000;
+    while let Some((dir, depth)) = pending.pop_front() {
+        if !visited.insert(dir.clone()) {
             continue;
         }
-        if depth >= 3 {
+        places.push(dir.clone());
+        if depth >= 3 || home.as_ref() == Some(&dir) {
             continue;
         }
-        if let Ok(entries) = p.read_dir() {
-            for e in entries.take(remaining).flatten() {
-                remaining -= 1;
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                if !name.starts_with('.')
-                    && !fs::is_sensitive(&name, true)
-                    && !matches!(name.as_ref(), "node_modules" | "target" | "build")
-                    && e.file_type().is_ok_and(|f| f.is_dir())
-                {
-                    todo.push((e.path(), depth + 1));
+        let Ok(entries) = dir.read_dir() else {
+            continue;
+        };
+        let mut child_dirs = Vec::new();
+        for entry in entries.take(budget).flatten() {
+            budget -= 1;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with('.')
+                && !fs::is_sensitive(&name, true)
+                && !NAV_SKIP_DIRS.contains(&name.as_ref())
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+            {
+                if fs::is_build_dir_name(&name) {
+                    places.push(entry.path());
+                } else {
+                    child_dirs.push(entry.path());
                 }
             }
         }
+        child_dirs.sort();
+        pending.extend(child_dirs.into_iter().map(|p| (p, depth + 1)));
+        if budget == 0 {
+            break;
+        }
     }
-    result
+    (places, budget == 0)
+}
+
+#[derive(Default)]
+struct LocationFacts {
+    aliases: Vec<String>,
+    purpose: String,
+}
+
+fn project_purpose(root: &Path) -> Option<String> {
+    let mut purpose = None;
+    for (file, section) in [
+        ("Cargo.toml", "package"),
+        ("pyproject.toml", "project"),
+        ("package.json", ""),
+    ] {
+        if let Ok(text) = fs::read_text(&root.join(file), 65536) {
+            purpose = if section.is_empty() {
+                serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v["description"].as_str().map(str::to_owned))
+            } else {
+                toml::from_str::<toml::Value>(&text).ok().and_then(|v| {
+                    v.get(section)?
+                        .get("description")?
+                        .as_str()
+                        .map(str::to_owned)
+                })
+            };
+            if purpose.is_some() {
+                break;
+            }
+        }
+    }
+    purpose
+}
+
+// The introduction is used locally for ranking. It is not part of model context.
+fn readme_purpose(root: &Path) -> Option<String> {
+    let text = fs::read_text(&root.join("README.md"), 65536).ok()?;
+    let introduction = text
+        .lines()
+        .take(18)
+        .filter(|line| !line.starts_with(['[', '!']) && !line.starts_with("```"))
+        .take_while(|line| !line.starts_with("## "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!introduction.trim().is_empty()).then(|| introduction.chars().take(460).collect())
+}
+
+fn location_facts(path: &Path) -> LocationFacts {
+    let Some(base) = data()
+        .ok()
+        .zip(identity(path).ok())
+        .map(|(dir, id)| dir.join("projects").join(id))
+    else {
+        return LocationFacts::default();
+    };
+    let prefs = read::<Preferences>(&base.join("preferences.json")).unwrap_or_default();
+    let purpose = prefs
+        .purpose
+        .or_else(|| project_purpose(path))
+        .or_else(|| readme_purpose(path))
+        .unwrap_or_default()
+        .to_lowercase();
+    LocationFacts {
+        aliases: prefs.aliases,
+        purpose,
+    }
+}
+
+fn choices(paths: &[PathBuf]) -> String {
+    format!(
+        "Which directory do you mean?{}",
+        paths
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(i, path)| format!("\n{}. {}", i + 1, path.display()))
+            .collect::<String>()
+    )
+}
+
+pub fn choose_project(prompt: &str, answer: &str) -> Option<PathBuf> {
+    let mut choices = prompt
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (n, path) = line.trim().split_once(". ")?;
+            Some((n.parse::<usize>().ok()?, PathBuf::from(path)))
+        })
+        .filter(|(n, p)| {
+            answer.parse::<usize>().ok() == Some(*n)
+                || p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case(answer))
+                || p == Path::new(answer)
+        });
+    let (_, path) = choices.next()?;
+    (choices.next().is_none() && path.is_dir()).then_some(path)
 }
 
 pub fn project_for(cwd: &Path, request: &str) -> Result<Option<PathBuf>, String> {
@@ -398,92 +535,517 @@ pub fn project_for(cwd: &Path, request: &str) -> Result<Option<PathBuf>, String>
         || requested.contains(" gui")
         || requested.contains("project");
     let nav = crate::intent::navigation_destination(request);
-    if nav.is_none() && !project_task && !requested.contains("that one") {
+    if nav.is_none()
+        && !project_task
+        && !previous_directory(request)
+        && !["that one", "that project", "previous project"]
+            .iter()
+            .any(|q| requested.contains(q))
+    {
         return Ok(None);
     }
-    if nav.is_some_and(|destination| {
-        let path = destination.trim().trim_matches(['\'', '"']);
-        crate::intent::is_home_destination(path)
-            || path.starts_with(['/', '.'])
-            || path.starts_with("~/")
-    }) {
-        return Ok(None);
-    }
-    if requested.contains("that one") {
+
+    if ["that one", "that project", "previous project"]
+        .iter()
+        .any(|q| requested.contains(q))
+    {
         let recent = session_path()
             .and_then(|p| read::<Vec<(u64, String, PathBuf)>>(&p).ok())
             .unwrap_or_default();
+        let current = ancestor_project(cwd).unwrap_or_else(|| cwd.to_owned());
         return recent
-            .first()
-            .filter(|(t, id, p)| {
-                now().saturating_sub(*t) < 86400 && identity(p).ok().as_ref() == Some(id)
+            .iter()
+            .find(|(t, id, p)| {
+                now().saturating_sub(*t) < 86400
+                    && identity(p).ok().as_ref() == Some(id)
+                    && (!requested.contains("previous project") || p != &current)
             })
             .map(|(_, _, p)| Some(p.clone()))
             .ok_or("Which project do you mean?".into());
     }
-    let dir = data().map_err(|e| e.to_string())?;
-    let mut paths: Vec<_> = read::<Locations>(&dir.join("locations.json"))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(id, p)| identity(p).ok().as_ref() == Some(id))
-        .map(|(_, p)| p)
-        .collect();
-    paths.extend(workspace_projects());
-    paths.sort();
-    paths.dedup();
-    let mut matched = Vec::new();
-    for p in paths {
-        let Some(id) = identity(&p).ok() else {
-            continue;
-        };
-        let prefs = read::<Preferences>(&dir.join("projects").join(id).join("preferences.json"))
-            .unwrap_or_default();
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let name = name.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
-        if prefs
-            .aliases
-            .iter()
-            .chain(std::iter::once(&name.to_owned()))
-            .any(|a| contains_name(nav.unwrap_or(request), a))
-        {
-            matched.push(p);
+    if nav.is_some() || previous_directory(request) {
+        return resolve_directory(request, cwd).map(Some);
+    }
+    let words = directory_words(&requested).collect::<Vec<_>>();
+    if words
+        .iter()
+        .any(|w| matches!(*w, "this" | "here" | "current"))
+        && !requested.contains(" in /")
+    {
+        return Ok(ancestor_project(cwd));
+    }
+    if let Some((_, trailing)) = request.split_once(" in ") {
+        let selected = trailing.trim().trim_matches(['\'', '"']);
+        if selected.starts_with('/') || selected.starts_with("./") || selected.starts_with("../") {
+            return cwd
+                .join(selected)
+                .canonicalize()
+                .ok()
+                .filter(|p| p.is_dir())
+                .map(Some)
+                .ok_or_else(|| "The requested project directory is unavailable.".into());
         }
     }
-    match matched.as_slice() {
-        [p] => Ok(Some(p.clone())),
-        [] if nav.is_none() => {
-            let root = cwd.ancestors().find(|p| manifest(p));
-            if let Some(nearest) = root.filter(|p| p.join("CMakeLists.txt").is_file()) {
-                // Subdirectory manifests often lack a project declaration. Walk only the
-                // containing project, stopping at a repository or another build system.
-                for p in nearest.ancestors() {
-                    if let Ok(source) = fs::read_text(&p.join("CMakeLists.txt"), 65536) {
-                        if source.lines().any(|line| {
-                            line.trim_start()
-                                .to_ascii_lowercase()
-                                .starts_with("project(")
-                        }) {
-                            return Ok(Some(p.to_owned()));
-                        }
-                    }
-                    if p.join(".git").exists()
-                        || (p != nearest && manifest(p) && !p.join("CMakeLists.txt").is_file())
+    let phrase: Vec<_> = words
+        .into_iter()
+        .filter(|w| {
+            !NAV_STOPWORDS.contains(w)
+                && !matches!(
+                    *w,
+                    "please"
+                        | "run"
+                        | "launch"
+                        | "start"
+                        | "open"
+                        | "execute"
+                        | "build"
+                        | "compile"
+                        | "then"
+                        | "app"
+                        | "application"
+                        | "gui"
+                        | "cli"
+                        | "server"
+                        | "service"
+                        | "web"
+                        | "preview"
+                        | "show"
+                        | "where"
+                        | "does"
+                        | "entrypoint"
+                )
+        })
+        .collect();
+    if !phrase.is_empty() {
+        let needle = phrase.join(" ");
+        match rank_locations(cwd, &needle, None, &phrase, true) {
+            Ok(path) => return Ok(Some(path)),
+            Err(message) if message.starts_with("Which ") => return Err(message),
+            Err(_) => {}
+        }
+    }
+    Ok(ancestor_project(cwd))
+}
+
+fn ancestor_project(cwd: &Path) -> Option<PathBuf> {
+    let nearest = cwd.ancestors().find(|p| manifest(p))?;
+    if nearest.join("CMakeLists.txt").is_file() {
+        for dir in nearest.ancestors() {
+            if fs::read_text(&dir.join("CMakeLists.txt"), 65536).is_ok_and(|source| {
+                source.lines().any(|line| {
+                    line.trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("project(")
+                })
+            }) {
+                return Some(dir.to_owned());
+            }
+            if dir.join(".git").exists()
+                || (dir != nearest && manifest(dir) && !dir.join("CMakeLists.txt").is_file())
+            {
+                break;
+            }
+        }
+    }
+    if nearest.join("Cargo.toml").is_file() {
+        for dir in nearest.ancestors().skip(1).take(6) {
+            if dir.join(".git").exists() || dir.join("Cargo.toml").is_file() {
+                if super::cargo::manifest(&dir.join("Cargo.toml"))
+                    .is_some_and(|m| m.get("workspace").is_some())
+                {
+                    return Some(dir.to_owned());
+                }
+                break;
+            }
+        }
+    }
+    Some(nearest.to_owned())
+}
+
+const NAV_STOPWORDS: &[&str] = &[
+    "my",
+    "the",
+    "that",
+    "a",
+    "an",
+    "to",
+    "me",
+    "i",
+    "meant",
+    "into",
+    "in",
+    "directory",
+    "dir",
+    "folder",
+    "project",
+    "projects",
+    "development",
+    "dev",
+    "code",
+    "work",
+    "workspace",
+    "repo",
+    "repos",
+    "please",
+    "for",
+    "and",
+    "of",
+    "change",
+    "changed",
+    "go",
+    "goes",
+    "navigate",
+    "switch",
+    "take",
+    "open",
+    "browse",
+    "cd",
+];
+
+/// Directories that are never useful navigation targets (caches, toolchains,
+/// package stores).
+const NAV_SKIP_DIRS: &[&str] = &[
+    ".cache",
+    ".npm",
+    ".cargo",
+    ".rustup",
+    ".local",
+    ".config",
+    ".git",
+    "node_modules",
+    "miniforge3",
+    "anaconda3",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+];
+
+/// Project-marker files that identify what a directory is used for.
+const MARKER_FILES: &[(&str, &str)] = &[
+    ("rust", "Cargo.toml"),
+    ("python", "pyproject.toml"),
+    ("python", "requirements.txt"),
+    ("javascript", "package.json"),
+    ("typescript", "package.json"),
+    ("node", "package.json"),
+    ("go", "go.mod"),
+    ("c++", "CMakeLists.txt"),
+    ("cpp", "CMakeLists.txt"),
+    ("java", "pom.xml"),
+    ("java", "build.gradle"),
+];
+
+pub fn previous_directory(request: &str) -> bool {
+    let request = request
+        .trim()
+        .trim_end_matches(['?', '.', '!'])
+        .to_lowercase();
+    matches!(
+        request.as_str(),
+        "go back"
+            | "go back where i was"
+            | "go back to the previous directory"
+            | "go to the previous directory"
+            | "cd -"
+    )
+}
+
+pub fn resolve_directory(request: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let home = config::home().map_err(|_| "home directory is unavailable")?;
+    let actual = |path: PathBuf| {
+        path.canonicalize()
+            .ok()
+            .filter(|p| p.is_dir())
+            .ok_or_else(|| "could not find the requested directory".to_owned())
+    };
+    if previous_directory(request) {
+        return std::env::var_os("GICO_PREVIOUS_DIR")
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| "The previous directory is unavailable in this shell.".into())
+            .and_then(|p| actual(PathBuf::from(p)));
+    }
+    let destination = intent::navigation_destination(request)
+        .or_else(|| request.split_once(" to ").map(|(_, target)| target));
+    if let Some(destination) = destination {
+        let path = destination.trim().trim_matches(['\'', '"']);
+        if intent::is_home_destination(destination) {
+            return actual(home);
+        }
+        let label = path.to_ascii_lowercase();
+        let label = label
+            .trim_start_matches("my ")
+            .trim_end_matches(" directory")
+            .trim_end_matches(" folder");
+        if matches!(
+            label,
+            "downloads" | "documents" | "desktop" | "pictures" | "music" | "videos"
+        ) {
+            let key = if label == "downloads" {
+                "DOWNLOAD".into()
+            } else {
+                label.to_uppercase()
+            };
+            let cfg = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"));
+            if let Ok(contents) = fs::read_text(&cfg.join("user-dirs.dirs"), 16384) {
+                if let Some(value) = contents
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("XDG_{key}_DIR=")))
+                {
+                    if let Some(value) =
+                        shlex::split(value).and_then(|mut v| (v.len() == 1).then(|| v.remove(0)))
                     {
-                        break;
+                        let configured = value
+                            .strip_prefix("$HOME/")
+                            .map(|p| home.join(p))
+                            .unwrap_or_else(|| PathBuf::from(value));
+                        if configured.is_absolute() {
+                            return actual(configured);
+                        }
                     }
                 }
             }
-            Ok(root.map(Path::to_owned))
+            let mut fallback = label.to_owned();
+            fallback[..1].make_ascii_uppercase();
+            return actual(home.join(fallback));
         }
-        [] => Ok(None),
-        _ => Err(format!(
-            "Which project do you mean? {}",
-            matched
-                .iter()
-                .take(3)
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" or ")
-        )),
+        if let Some(relative) = path.strip_prefix("~/") {
+            return actual(home.join(relative));
+        }
+        if path.starts_with(['/', '.']) || cwd.join(path).is_dir() {
+            return actual(cwd.join(path));
+        }
     }
+    let lower = destination.unwrap_or(request).to_lowercase();
+    // “to where <name> is” identifies a named directory. A partial match
+    // (for example, a sibling project sharing two words) is insufficient.
+    let named = lower
+        .trim_end_matches(['.', '?', '!'])
+        .trim_end()
+        .strip_prefix("where ")
+        .and_then(|end| end.strip_suffix(" is"))
+        .map(|name| name.trim().trim_matches(['\'', '"']));
+    let tokens: Vec<_> = directory_words(&lower)
+        .filter(|word| !word.is_empty() && !NAV_STOPWORDS.contains(word))
+        .collect();
+    if tokens.is_empty() {
+        return Err("could not find a directory matching the request".into());
+    }
+
+    rank_locations(cwd, &lower, named, &tokens, false)
+}
+
+fn rank_locations(
+    cwd: &Path,
+    lower: &str,
+    named: Option<&str>,
+    tokens: &[&str],
+    projects_only: bool,
+) -> Result<PathBuf, String> {
+    let (mut places, incomplete) = workspace_places(cwd);
+    if let Ok(dir) = data() {
+        places.extend(
+            read::<Locations>(&dir.join("locations.json"))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(id, p)| (identity(&p).ok().as_ref() == Some(&id)).then_some(p)),
+        );
+    }
+    places.sort();
+    places.dedup();
+    let mut ranked = Vec::new();
+    for path in places {
+        if projects_only && !manifest(&path) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|p| p.to_str()) else {
+            continue;
+        };
+        let lower_name = name.to_lowercase();
+        let facts = if manifest(&path) {
+            location_facts(&path)
+        } else {
+            LocationFacts::default()
+        };
+        let parent_name = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let js = path.join("package.json").is_file() && !path.join("tsconfig.json").is_file();
+        if tokens.iter().any(|w| match *w {
+            "js" | "javascript" => {
+                !js && !directory_words(&lower_name)
+                    .chain(directory_words(&parent_name))
+                    .any(|n| matches!(n, "js" | "javascript"))
+            }
+            "ts" | "typescript" => {
+                !path.join("tsconfig.json").is_file()
+                    && !directory_words(&lower_name)
+                        .chain(directory_words(&parent_name))
+                        .any(|n| matches!(n, "ts" | "typescript"))
+            }
+            "old" | "legacy" => !directory_words(&lower_name)
+                .any(|n| matches!(n, "old" | "legacy" | "archive" | "archived")),
+            "production" | "development" => !directory_words(&lower_name).any(|n| {
+                n == *w
+                    || (*w == "development" && n == "dev")
+                    || (*w == "production" && n == "prod")
+            }),
+            _ => false,
+        }) {
+            continue;
+        }
+        let rank = if let Some(expected) = named {
+            (lower_name == expected).then_some(100)
+        } else if facts
+            .aliases
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(lower.trim()) || contains_name(lower, a))
+        {
+            Some(120)
+        } else if lower_name == lower.trim()
+            || (projects_only
+                && contains_name(
+                    lower,
+                    lower_name
+                        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
+                        .trim(),
+                ))
+        {
+            Some(110)
+        } else {
+            let meaningful: Vec<_> = tokens
+                .iter()
+                .copied()
+                .filter(|w| {
+                    !matches!(
+                        *w,
+                        "old" | "legacy" | "js" | "ts" | "production" | "development"
+                    )
+                })
+                .collect();
+            directory_rank(&path, &lower_name, &meaningful)
+                .map(|r| 30 + r)
+                .or_else(|| {
+                    let name = directory_words(&lower_name);
+                    let purpose = directory_words(&facts.purpose);
+                    (!facts.purpose.is_empty()
+                        && !meaningful.is_empty()
+                        && meaningful
+                            .iter()
+                            .all(|token| name.clone().chain(purpose.clone()).any(|w| w == *token)))
+                    .then(|| {
+                        20 + 3 * meaningful
+                            .iter()
+                            .filter(|token| name.clone().any(|w| w == **token))
+                            .count()
+                    })
+                })
+        };
+        if let Some(rank) = rank {
+            ranked.push((rank, path));
+        }
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let Some((rank, path)) = ranked.first() else {
+        return Err(if incomplete {
+            "Directory search reached its limit before finding a match."
+        } else {
+            "could not find a directory matching the request"
+        }
+        .into());
+    };
+    let close = ranked
+        .iter()
+        .take_while(|(r, _)| rank.saturating_sub(*r) <= 1)
+        .map(|(_, p)| p.clone())
+        .collect::<Vec<_>>();
+    if close.len() > 1 {
+        return Err(choices(&close));
+    }
+    if incomplete && *rank < 100 {
+        return Err(
+            "Directory search reached its limit. Supply a project alias or a narrower location."
+                .into(),
+        );
+    }
+    Ok(cmake::relocated_source(path)
+        .map_err(str::to_owned)?
+        .unwrap_or_else(|| path.clone()))
+}
+
+fn directory_words(name: &str) -> impl Iterator<Item = &str> + Clone {
+    name.split(|c: char| !c.is_alphanumeric() && c != '+')
+        .filter(|word| !word.is_empty())
+}
+
+fn canonical_language(word: &str) -> &str {
+    match word {
+        "cpp" => "c++",
+        _ => word,
+    }
+}
+
+fn directory_rank(path: &Path, name: &str, tokens: &[&str]) -> Option<usize> {
+    let words = directory_words(name).map(canonical_language);
+    let mut score = 0;
+    for &token in tokens {
+        let token = canonical_language(token);
+        if words.clone().any(|word| word == token) {
+            score += 3;
+            continue;
+        }
+        let language = MARKER_FILES.iter().any(|&(lang, _)| lang == token);
+        if language {
+            // A language can qualify a project name through its containing
+            // folder or a build file. A language-only request needs a named folder.
+            if tokens.len() == 1 {
+                return None;
+            }
+            let parent = path.parent()?.file_name()?.to_str()?.to_lowercase();
+            if directory_words(&parent)
+                .map(canonical_language)
+                .any(|word| word == token)
+                || MARKER_FILES
+                    .iter()
+                    .any(|&(lang, file)| lang == token && path.join(file).is_file())
+            {
+                continue;
+            }
+            return None;
+        }
+        let quality = words
+            .clone()
+            .filter_map(|word| {
+                if token.len() >= 3 && word.starts_with(token) {
+                    return Some(2);
+                }
+                (token.len() >= 4
+                    && word.len() >= 4
+                    && word.len().abs_diff(token.len()) <= 1
+                    && strsim::osa_distance(token, word) <= 1)
+                    .then_some(1)
+            })
+            .max()?;
+        score += quality;
+    }
+    if let [token] = tokens {
+        let marker = MARKER_FILES.iter().any(|(lang, file)| {
+            lang == token && (path.join(file).is_file() || dir_has_child_marker(path, file))
+        });
+        score += usize::from(marker);
+    }
+    Some(score)
+}
+
+fn dir_has_child_marker(dir: &Path, marker: &str) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.take(50).flatten().any(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir()) && entry.path().join(marker).is_file()
+        })
+    })
 }

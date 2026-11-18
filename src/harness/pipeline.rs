@@ -10,7 +10,7 @@ use crate::intent::{self, Intent};
 use crate::verify::{self, Issue, Report, Severity, Verdict};
 use crate::{discovery::Reply, plan};
 
-use super::{exec_shell, ApprovalPolicy, CancelToken, ExecOutcome, Harness, OpKind, OpOutcome};
+use super::{ApprovalPolicy, CancelToken, ExecOutcome, Harness, OpKind, OpOutcome};
 
 #[derive(PartialEq)]
 struct FileIdentity(u64, u64, Option<(u64, i64, i64)>);
@@ -33,9 +33,16 @@ pub struct Candidate {
     directory_identity: Option<FileIdentity>,
     argv: Option<Vec<String>>,
     paths: Vec<(PathBuf, PathBuf, FileIdentity)>,
+    readiness: Option<super::readiness::Readiness>,
 }
 
 impl Candidate {
+    pub fn same_evidence(&self, other: &Self) -> bool {
+        self.cwd == other.cwd
+            && self.directory_identity == other.directory_identity
+            && self.paths == other.paths
+    }
+
     pub fn argv(&self) -> Option<&[String]> {
         self.argv.as_deref()
     }
@@ -64,6 +71,7 @@ enum Operation {
 pub struct ApprovedOperation {
     operation: Operation,
     cwd: PathBuf,
+    readiness: Option<super::readiness::Readiness>,
 }
 
 impl ApprovedOperation {
@@ -77,11 +85,15 @@ impl ApprovedOperation {
             Operation::Argv(argv) => {
                 let mut builder = std::process::Command::new(&argv[0]);
                 builder.args(&argv[1..]);
-                super::process::exec_process(builder, &self.cwd, cancel, timeout)
+                super::process::exec_process(builder, &self.cwd, cancel, timeout, self.readiness)
                     .map(Dispatch::Shell)
             }
             Operation::Shell(command) => {
-                exec_shell(&command, &self.cwd, cancel, timeout).map(Dispatch::Shell)
+                let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+                let mut builder = std::process::Command::new(shell);
+                builder.args(["-c", &command]);
+                super::process::exec_process(builder, &self.cwd, cancel, timeout, self.readiness)
+                    .map(Dispatch::Shell)
             }
             Operation::Navigate(target) => {
                 if cancel.is_cancelled() {
@@ -174,13 +186,35 @@ pub fn verify_candidate(
             });
         }
     }
-    if matches!(
-        intent::classify(request, raw),
-        Intent::Run | Intent::BuildAndRun
-    ) && query.is_none()
-        && plan::requested_target_kind(request).is_some()
-        && !matches_named_launch(raw, request, &command)
-    {
+    let launch_request = crate::launch::Request::parse(request, raw);
+    let launch = crate::launch::resolve(raw, &launch_request);
+    let same_command = |expected: &str| {
+        expected == command
+            || verify::literal_words(expected)
+                .zip(verify::literal_words(&command))
+                .is_some_and(|(a, b)| a == b)
+    };
+    let is_launch =
+        matches!(launch_request.action, Intent::Run | Intent::BuildAndRun) && query.is_none();
+    let invalid_launch = match &launch {
+        crate::launch::Resolution::Resolved(target) => {
+            if target.shell.is_some()
+                && !target.argv.is_empty()
+                && launch_request.arguments.is_empty()
+            {
+                !verify::literal_words(&command).is_some_and(|argv| argv.starts_with(&target.argv))
+            } else {
+                !same_command(&target.command())
+            }
+        }
+        crate::launch::Resolution::NeedUserChoice(_)
+        | crate::launch::Resolution::Unavailable(_) => true,
+        crate::launch::Resolution::NeedEvidence => {
+            plan::requested_target_kind(request).is_some()
+                && !matches_named_launch(raw, request, &command)
+        }
+    };
+    if is_launch && invalid_launch {
         report.issues.push(Issue {
             severity: Severity::Error,
             message: "the command does not launch the verified target for this request".into(),
@@ -196,6 +230,14 @@ pub fn verify_candidate(
         Vec::new()
     } else {
         let mut paths = verify::existing_paths(&command, cwd);
+        if let crate::launch::Resolution::Resolved(target) = &launch {
+            paths.extend(
+                target
+                    .evidence
+                    .iter()
+                    .filter_map(|p| p.canonicalize().ok().map(|r| (p.clone(), r))),
+            );
+        }
         if matches!(
             intent::classify(request, raw),
             Intent::Build | Intent::BuildAndRun | Intent::Run | Intent::Test | Intent::Clean
@@ -238,7 +280,22 @@ pub fn verify_candidate(
             .collect()
     };
     harness.record_duration(OpKind::Verify, &command, outcome, start.elapsed());
+    let role = match &launch {
+        crate::launch::Resolution::Resolved(target) => target.role,
+        _ => launch_request.role,
+    };
+    let executable = match &launch {
+        crate::launch::Resolution::Resolved(target) => target.executable.clone(),
+        _ => verify::literal_words(&command).and_then(|words| {
+            Path::new(words.first()?)
+                .file_name()?
+                .to_str()
+                .map(str::to_owned)
+        }),
+    };
+    let readiness = launch_readiness(role, executable, request);
     Candidate {
+        readiness,
         paths,
         argv: None,
         command,
@@ -246,6 +303,20 @@ pub fn verify_candidate(
         note,
         directory_identity: fingerprint(cwd),
         cwd: cwd.clone(),
+    }
+}
+
+fn launch_readiness(
+    role: crate::launch::Role,
+    executable: Option<String>,
+    request: &str,
+) -> Option<super::readiness::Readiness> {
+    use super::readiness::Readiness;
+    use crate::launch::Role;
+    match role {
+        Role::Gui => Some(Readiness::Window(executable)),
+        Role::Service | Role::Web => Some(Readiness::Listener(intent::port_number(request))),
+        _ => None,
     }
 }
 
@@ -306,7 +377,24 @@ pub fn authorize(
             return Err(message);
         }
     }
-    let verified = verify_candidate(harness, raw, request, command.clone(), None);
+    let mut verified = verify_candidate(harness, raw, request, command.clone(), None);
+    if intent::classify(request, raw) == Intent::Ambiguous && candidate.argv.is_some() {
+        if let Some(target) = crate::launch::semantic_options(raw, request)
+            .into_iter()
+            .find(|target| target.command() == *command)
+        {
+            for path in target.evidence {
+                if let Ok(resolved) = path.canonicalize() {
+                    if let Some(id) = fingerprint(&resolved) {
+                        verified.paths.push((path, resolved, id));
+                    }
+                }
+            }
+            verified.paths.sort_by(|a, b| a.0.cmp(&b.0));
+            verified.paths.dedup_by(|a, b| a.0 == b.0);
+            verified.readiness = launch_readiness(target.role, target.executable, request);
+        }
+    }
     if verified.paths != candidate.paths && verified.report.verdict() != Verdict::Blocked {
         let reason = "resolved inputs changed since preview";
         harness.record(OpKind::Approve, command, OpOutcome::Blocked(reason.into()));
@@ -330,6 +418,7 @@ pub fn authorize(
     Ok(ApprovedOperation {
         operation,
         cwd: cwd.clone(),
+        readiness: verified.readiness,
     })
 }
 
@@ -439,6 +528,46 @@ pub fn prepare(
         return Preparation::Information { title, detail };
     }
     let start = Instant::now();
+    match crate::launch::resolve(raw, &crate::launch::Request::parse(request, raw)) {
+        crate::launch::Resolution::Resolved(target) => {
+            let command = target.command();
+            if crate::constraints::shortcut_fits(
+                raw,
+                intent::classify(request, raw),
+                request,
+                &command,
+            ) {
+                let mut candidate = verify_candidate(
+                    harness,
+                    raw,
+                    request,
+                    command,
+                    target.note.clone().or_else(|| {
+                        Some(format!(
+                            "{} · {}",
+                            crate::launch::role_name(target.role),
+                            target.label
+                        ))
+                    }),
+                );
+                if target.build.is_none() && target.shell.is_none() {
+                    candidate.argv = Some(target.argv);
+                }
+                harness.record(OpKind::Plan, "resolved launch capability", OpOutcome::Ok);
+                return Preparation::Candidate(candidate);
+            }
+        }
+        crate::launch::Resolution::NeedUserChoice(choices) => {
+            return Preparation::Clarify(crate::launch::choice_prompt(&choices));
+        }
+        crate::launch::Resolution::Unavailable(title) => {
+            return Preparation::Information {
+                title,
+                detail: String::new(),
+            };
+        }
+        crate::launch::Resolution::NeedEvidence => {}
+    }
     if let Some(plan) = plan::plan(raw, request) {
         harness.record_ms(
             OpKind::Plan,
@@ -508,6 +637,29 @@ pub fn generate_candidate(
         (OpOutcome::Cancelled, Preparation::Cancelled)
     } else {
         match generated {
+            Ok(Reply::Launch(target)) => {
+                let label = format!(
+                    "{} · {}",
+                    crate::launch::role_name(target.role),
+                    target.label
+                );
+                let mut candidate =
+                    verify_candidate(harness, raw, request, target.command(), Some(label));
+                candidate.readiness = launch_readiness(target.role, target.executable, request);
+                for path in target.evidence {
+                    if let Ok(resolved) = path.canonicalize() {
+                        if let Some(id) = fingerprint(&resolved) {
+                            candidate.paths.push((path, resolved, id));
+                        }
+                    }
+                }
+                candidate.paths.sort_by(|a, b| a.0.cmp(&b.0));
+                candidate.paths.dedup_by(|a, b| a.0 == b.0);
+                if target.shell.is_none() && target.build.is_none() {
+                    candidate.argv = Some(target.argv);
+                }
+                (OpOutcome::Ok, Preparation::Candidate(candidate))
+            }
             Ok(Reply::Argv(argv)) => {
                 let command = argv
                     .iter()

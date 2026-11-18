@@ -1291,7 +1291,7 @@ pub(crate) fn intent_issues_at(request: &str, command: &str, cwd: &Path) -> Vec<
     let evidence = [
         "cmake", "make", "ninja", "cargo", "npm", "pnpm", "yarn", "bun", "g++", "gcc", "clang",
         "clang++", "cc", "c++", "python3", "python", "go ", "javac", "ctest", "./", "*.cpp",
-        "*.py", "output",
+        "*.py", "output", "dotnet", "java ", "just ",
     ];
     let joined = command.to_lowercase();
     if !evidence.iter().any(|e| joined.contains(e)) {
@@ -1315,7 +1315,12 @@ pub(crate) fn intent_issues_at(request: &str, command: &str, cwd: &Path) -> Vec<
                 .unwrap_or("");
             let sub = args.first().map(String::as_str);
             match name {
-                "cargo" | "go" => sub == Some("run"),
+                "cargo" | "go" | "dotnet" | "just" => sub == Some("run"),
+                "make" => {
+                    sub == Some("run")
+                        && crate::context::fs::read_text(&cwd.join("Makefile"), 65536)
+                            .is_ok_and(|text| text.lines().any(|line| line.starts_with("run:")))
+                }
                 "npm" | "pnpm" | "yarn" | "bun" => {
                     let script = if matches!(sub, Some("run" | "run-script")) {
                         args.get(1).map(String::as_str)
@@ -1323,7 +1328,7 @@ pub(crate) fn intent_issues_at(request: &str, command: &str, cwd: &Path) -> Vec<
                         sub
                     };
                     script.is_some_and(|s| {
-                        matches!(s, "start" | "dev" | "serve")
+                        matches!(s, "start" | "dev" | "serve" | "server")
                             && crate::context::fs::read_text(&cwd.join("package.json"), 65536)
                                 .ok()
                                 .and_then(|text| {

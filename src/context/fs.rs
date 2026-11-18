@@ -319,6 +319,7 @@ fn walk(
         .filter_map(|e| e.ok().map(|e| e.path()))
         .collect();
     children.sort();
+    let mut directories = Vec::new();
     for path in children {
         if *total >= visit_limit {
             break;
@@ -389,20 +390,23 @@ fn walk(
             depth,
         });
         if is_dir && depth < max_depth {
-            walk(
-                root,
-                &path,
-                depth + 1,
-                max_depth,
-                max_entries,
-                entries,
-                total,
-                excl_sens,
-                excl_inj,
-                skipped,
-                cmake_build_dirs,
-            );
+            directories.push(path);
         }
+    }
+    for path in directories {
+        walk(
+            root,
+            &path,
+            depth + 1,
+            max_depth,
+            max_entries,
+            entries,
+            total,
+            excl_sens,
+            excl_inj,
+            skipped,
+            cmake_build_dirs,
+        );
     }
 }
 

@@ -12,6 +12,7 @@ use std::time::Instant;
 pub enum Reply {
     Command(String),
     Argv(Vec<String>),
+    Launch(Box<crate::launch::Launch>),
     Answer(String),
     Clarify(String),
 }
@@ -22,6 +23,7 @@ enum Turn {
     Inspect { tool: String, value: String },
     Count { unit: String, source: String },
     Propose { argv: Vec<String> },
+    ChooseLaunch { id: u32 },
     Shell { command: String },
     Answer { text: String },
     Clarify { question: String },
@@ -299,6 +301,25 @@ pub fn interpret(
             json!(e.path)
         ));
     }
+    let options = if !allow_answer && count.is_none() && !no_context {
+        crate::launch::semantic_options(raw, request)
+    } else {
+        Vec::new()
+    };
+    if !options.is_empty() {
+        let descriptions = options.iter().enumerate().map(|(id, launch)| {
+            json!({"id":id, "label":bounded(&launch.label, 96), "role":crate::launch::role_name(launch.role)})
+        }).collect::<Vec<_>>();
+        schema["oneOf"]
+            .as_array_mut()
+            .expect("structured variants")
+            .push(json!({
+                "type":"object","properties":{"kind":{"const":"choose_launch"},
+                    "id":{"type":"integer","enum":(0..options.len()).collect::<Vec<_>>()}},
+                "required":["kind","id"],"additionalProperties":false
+            }));
+        prompt.push_str(&format!("If the user asks to launch an application, select a verified launch identifier or clarify if unclear. Launch candidates: {}\n",json!(descriptions)));
+    }
     for _ in 0..3 {
         let limit = harness.inference_budget();
         if limit.is_zero() {
@@ -364,6 +385,9 @@ pub fn interpret(
                     .expect("matched count")
                     .command(&raw.environment.cwd)
                     .map(Reply::Command);
+            }
+            Ok(Turn::ChooseLaunch { id }) if (id as usize) < options.len() => {
+                return Ok(Reply::Launch(Box::new(options[id as usize].clone())));
             }
             Ok(Turn::Propose { argv })
                 if document.is_none()
