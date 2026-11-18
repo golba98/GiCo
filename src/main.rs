@@ -332,8 +332,25 @@ fn main() -> ExitCode {
                     "using defaults"
                 }
             );
-            println!("backend: {} at {}\nmodel: {}\ncontext: {} tokens; output: {}; temperature: {}\npreload: {}; idle: {}s",
-                cfg.backend,cfg.endpoint,cfg.model,cfg.context_size,cfg.max_tokens,cfg.temperature,cfg.preload,cfg.idle_seconds);
+            println!(
+                "backend: {} at {}\nmodel: {}",
+                cfg.backend, client.endpoint, cfg.model
+            );
+            if client.backend == Backend::OpenAiResponses {
+                println!(
+                    "Responses API · reasoning {} · output limit {} · local preload disabled",
+                    cfg.reasoning_effort, cfg.max_tokens
+                );
+            } else {
+                println!(
+                    "context: {} tokens; output: {}; temperature: {}\npreload: {}; idle: {}s",
+                    cfg.context_size,
+                    cfg.max_tokens,
+                    cfg.temperature,
+                    cfg.preload,
+                    cfg.idle_seconds
+                );
+            }
             match client.list_models() {
                 Ok(models) if models.contains(&cfg.model) => (),
                 Ok(_) => {
@@ -345,7 +362,7 @@ fn main() -> ExitCode {
                         ),
                     )
                 }
-                Err(e) => return io_error("service unavailable", e),
+                Err(e) => return io_error("provider status", e),
             }
             if client.backend == Backend::Ollama {
                 let details = match client.details() {
@@ -389,10 +406,7 @@ fn main() -> ExitCode {
                     Ok(None) => println!("runner: installed, unloaded"),
                     Err(e) => return io_error("runner status", e),
                 },
-                Backend::OpenAiResponses => println!(
-                    "OpenAI Responses · reasoning {} · local preload disabled",
-                    cfg.reasoning_effort
-                ),
+                Backend::OpenAiResponses => println!("model access: available"),
                 Backend::OpenAiCompatible => {
                     println!("runner: provider-managed; native preload unavailable")
                 }

@@ -2,7 +2,7 @@
 
 GiCo is a Rust terminal assistant for Linux. It turns a request into a shell
 command using evidence from the current directory and, when needed, a small
-local model. You can inspect, refine, or edit the command before running it.
+local model or an explicitly selected OpenAI provider. You can inspect, refine, or edit the command before running it.
 
 ```text
 $ gico "list files in this directory"
