@@ -312,20 +312,29 @@ pub fn interpret(
             return Err("request exceeds the configured context after reserving output; shorten the request or increase context_size".into());
         }
         client.usage.replace(None);
+        client.cloud_usage.replace(Default::default());
         let reply = client.request(&prompt, &cancel, Some(&schema), limit);
         if let Some((input, output, reason)) = client.usage.borrow().as_ref() {
             harness.record(OpKind::Inspect,&format!("provider usage: {input} input, {output} output, stop={reason}, {} prompt bytes",prompt.len()),OpOutcome::Ok);
+        }
+        if client.backend == crate::llm::Backend::OpenAiResponses {
+            client.cloud_usage.borrow_mut().latency_ms = t.elapsed().as_millis();
+            let u = client.cloud_usage.borrow();
+            if crate::usage::record(&u).is_err() {
+                eprintln!("gico: could not update local usage totals");
+            }
+            harness.record(OpKind::Generate,&format!("OpenAI usage: {} requests, {} input ({} cached), {} output ({} reasoning), {} ms, estimated USD {}",u.attempts,u.input,u.cached,u.output,u.reasoning,u.latency_ms,u.estimated_usd.map_or("unavailable".into(),|n|format!("{n:.8}"))),OpOutcome::Ok);
         }
         let outcome = match &reply {
             Ok(_) => OpOutcome::Ok,
             Err(e) => OpOutcome::Failed(e.to_string()),
         };
         harness.record_duration(OpKind::Generate, "provider response", outcome, t.elapsed());
-        if client.debug {
+        if client.debug && client.backend != crate::llm::Backend::OpenAiResponses {
             eprintln!("model input: {}", crate::ui::safe_multiline(&prompt));
         }
         let reply = reply.map_err(|e| e.to_string())?;
-        if client.debug {
+        if client.debug && client.backend != crate::llm::Backend::OpenAiResponses {
             eprintln!("model output: {}", crate::ui::safe_multiline(&reply));
         }
         let valid =
@@ -336,6 +345,14 @@ pub fn interpret(
                     .as_ref()
                     .is_some_and(|e| e.unit == unit && e.path == source) =>
             {
+                harness.record(
+                    OpKind::Plan,
+                    &format!(
+                        "decoded count {}",
+                        json!({"kind":"count","source":source,"unit":unit})
+                    ),
+                    OpOutcome::Ok,
+                );
                 return count
                     .as_ref()
                     .expect("matched count")
@@ -359,7 +376,7 @@ pub fn interpret(
             {
                 return Ok(Reply::Command(command))
             }
-            Ok(Turn::Answer { text }) if allow_answer && valid(&text) => {
+            Ok(Turn::Answer { text }) if allow_answer && count.is_none() && valid(&text) => {
                 return Ok(Reply::Answer(text))
             }
             Ok(Turn::Clarify { question }) if valid(&question) => {

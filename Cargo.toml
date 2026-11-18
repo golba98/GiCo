@@ -1,6 +1,6 @@
 [package]
 name = "gico"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "GiCo - context-aware local AI terminal assistant for small local models"
 license = "MIT AND Apache-2.0"
@@ -22,6 +22,7 @@ shlex = "1.3"  # same crate+pin codex-rs/shell-command uses for POSIX word split
 unicode-segmentation = "1.13"
 unicode-width = { version = "0.2", default-features = false }
 regex-lite = "0.1.8"
+rpassword = "7"
 
 [dev-dependencies]
 portable-pty = "0.9"

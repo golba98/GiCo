@@ -184,6 +184,7 @@ def approved(
     peers=0,
     legacy=False,
     audit=None,
+    final_reply=None,
 ):
     # Replay the live proposal at GiCo's actual approval screen inside the fixture.
     # Only the second model response is injected. Verification and dispatch are real.
@@ -203,6 +204,8 @@ def approved(
                 "--setenv",
                 "GICO_ENDPOINT",
                 "http://127.0.0.1:19018",
+                "--setenv", "GICO_BACKEND", "ollama",
+                "--setenv", "GICO_MODEL", "fixture",
             ]
         )
         if legacy:
@@ -214,7 +217,7 @@ def approved(
                 if decision.get("argv")
                 else {"kind": "shell", "command": command}
             )
-            args.extend(["--setenv", "FIXTURE_REPLY", json.dumps(response)])
+            args.extend(["--setenv", "FIXTURE_REPLY", json.dumps(final_reply or response)])
         startup = ""
         if peers:
             startup += "for i in 1 2 3 4 5; do sleep 8 & done; "
@@ -299,8 +302,8 @@ s.server_close(); os.execv('/gico-fixture',['/gico-fixture',*sys.argv[1:]])
             if target.is_file():
                 output = target.read_bytes().rstrip(b"\x00").decode()
             return 0, output, ""
-        except (pexpect.EOF, pexpect.TIMEOUT) as e:
-            return 125, "", "no matching verified approval: " + str(e.before)[:512]
+        except (pexpect.EOF, pexpect.TIMEOUT):
+            return 125, "", "no matching verified approval: " + str(p.before)[:512]
         finally:
             p.close(force=True)
             log = Path(handoff) / "replay.log"
@@ -460,6 +463,9 @@ def one(case, binary, model, structured):
 
             audit = {}
 
+            structured_counts = [line.removeprefix("op plan: decoded count ").rsplit(" (", 1)[0] for line in trace.splitlines() if line.startswith("op plan: decoded count ")]
+            final_reply = json.loads(structured_counts[-1]) if structured_counts else None
+
             def executor(peers=0):
                 return approved(
                     binary,
@@ -473,6 +479,7 @@ def one(case, binary, model, structured):
                     peers,
                     legacy=not structured,
                     audit=audit if not peers else None,
+                    final_reply=final_reply,
                 )
 
             rc, out, err = executor()

@@ -9,6 +9,9 @@ use std::{
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    pub reasoning_effort: String,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub profiles: std::collections::BTreeMap<String, ProviderProfile>,
     pub model: String,
     pub backend: String,
     pub endpoint: String,
@@ -20,9 +23,18 @@ pub struct Config {
     pub idle_seconds: u32,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProviderProfile {
+    model: String,
+    endpoint: String,
+    reasoning_effort: String,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
+            reasoning_effort: "none".into(),
+            profiles: Default::default(),
             model: "qwen2.5-coder:0.5b".into(),
             backend: "ollama".into(),
             endpoint: "http://127.0.0.1:11434".into(),
@@ -64,17 +76,70 @@ pub fn private_write(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 impl Config {
+    pub fn select_backend(&mut self, name: &str) {
+        let old = crate::llm::Backend::parse(&self.backend);
+        let new = crate::llm::Backend::parse(name);
+        if old != new {
+            self.profiles.insert(
+                self.backend.clone(),
+                ProviderProfile {
+                    model: self.model.clone(),
+                    endpoint: self.endpoint.clone(),
+                    reasoning_effort: self.reasoning_effort.clone(),
+                },
+            );
+            if let Some(profile) = self.profiles.get(name) {
+                self.model = profile.model.clone();
+                self.endpoint = profile.endpoint.clone();
+                self.reasoning_effort = profile.reasoning_effort.clone();
+            } else {
+                match new {
+                    Some(crate::llm::Backend::OpenAiResponses) => {
+                        self.model = crate::responses::MODEL.into();
+                        self.endpoint = crate::responses::ENDPOINT.into();
+                        self.reasoning_effort = "none".into();
+                    }
+                    Some(crate::llm::Backend::Ollama) => {
+                        let defaults = Self::default();
+                        self.model = defaults.model;
+                        self.endpoint = defaults.endpoint;
+                    }
+                    Some(crate::llm::Backend::OpenAiCompatible) => {
+                        self.model.clear();
+                        self.endpoint = "http://127.0.0.1:8080".into();
+                    }
+                    None => {}
+                }
+            }
+        }
+        self.backend = name.to_owned();
+    }
     pub fn load(path: &Path) -> Result<Self, String> {
         let mut cfg: Self = match fs::read_to_string(path) {
             Ok(data) => {
-                toml::from_str(&data).map_err(|e| format!("invalid {}: {e}", path.display()))?
+                let mut table: toml::Table = toml::from_str(&data)
+                    .map_err(|_| format!("invalid TOML in {}", path.display()))?;
+                if table.get("backend").and_then(|v| v.as_str()) == Some("openai") {
+                    table
+                        .entry("model")
+                        .or_insert(crate::responses::MODEL.into());
+                    table
+                        .entry("endpoint")
+                        .or_insert(crate::responses::ENDPOINT.into());
+                }
+                table
+                    .try_into()
+                    .map_err(|_| format!("invalid configuration fields in {}", path.display()))?
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e.to_string()),
         };
+        if let Ok(backend) = std::env::var("GICO_BACKEND") {
+            cfg.select_backend(&backend);
+        }
         for (key, value) in [
             ("GICO_MODEL", &mut cfg.model),
-            ("GICO_BACKEND", &mut cfg.backend),
+            ("GICO_REASONING_EFFORT", &mut cfg.reasoning_effort),
             ("GICO_ENDPOINT", &mut cfg.endpoint),
         ] {
             if let Ok(s) = std::env::var(key) {
@@ -137,7 +202,20 @@ impl Config {
                 "invalid model, token budget, context, temperature or idle duration".into(),
             );
         }
-        let mut client = LlmClient::new(backend, &self.endpoint, &self.model);
+        let endpoint = if backend == Backend::OpenAiResponses {
+            crate::responses::validate_endpoint(&self.endpoint)?;
+            crate::responses::ENDPOINT
+        } else {
+            &self.endpoint
+        };
+        if !matches!(
+            self.reasoning_effort.as_str(),
+            "none" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            return Err("unsupported reasoning effort".into());
+        }
+        let mut client = LlmClient::new(backend, endpoint, &self.model);
+        client.reasoning.clone_from(&self.reasoning_effort);
         client.temperature = self.temperature;
         client.max_tokens = self.max_tokens;
         client.context_size = self.context_size;

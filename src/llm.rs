@@ -9,15 +9,15 @@ pub enum Backend {
     Ollama,
     /// llama.cpp `llama-server` or any OpenAI-compatible local server.
     OpenAiCompatible,
+    OpenAiResponses,
 }
 
 impl Backend {
     pub fn parse(s: &str) -> Option<Backend> {
         match s.to_ascii_lowercase().as_str() {
+            "openai" => Some(Backend::OpenAiResponses),
             "ollama" => Some(Backend::Ollama),
-            "llamacpp" | "llama.cpp" | "llama-cpp" | "openai" | "oai" => {
-                Some(Backend::OpenAiCompatible)
-            }
+            "llamacpp" | "llama.cpp" | "llama-cpp" | "oai" => Some(Backend::OpenAiCompatible),
             _ => None,
         }
     }
@@ -35,7 +35,9 @@ pub struct LlmClient {
     pub prompt_chars: std::cell::Cell<usize>,
     pub idle_seconds: u32,
     discovered: std::cell::OnceCell<String>,
-    http: reqwest::Client,
+    pub reasoning: String,
+    pub cloud_usage: std::cell::RefCell<crate::responses::Usage>,
+    pub(crate) http: reqwest::Client,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -95,7 +97,11 @@ struct OllamaTag {
 
 impl LlmClient {
     pub fn new(backend: Backend, endpoint: &str, model: &str) -> Self {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder();
+        if backend == Backend::OpenAiResponses {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let http = builder
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("failed to build HTTP client");
@@ -111,6 +117,8 @@ impl LlmClient {
             prompt_chars: Default::default(),
             idle_seconds: 300,
             discovered: Default::default(),
+            reasoning: "none".into(),
+            cloud_usage: Default::default(),
             http,
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -160,6 +168,7 @@ impl LlmClient {
         format: Option<&serde_json::Value>,
     ) -> Result<String, LlmError> {
         match self.backend {
+            Backend::OpenAiResponses => crate::responses::complete(self, prompt, format).await,
             Backend::Ollama => self.complete_ollama(prompt, format).await,
             Backend::OpenAiCompatible => self.complete_oai(prompt, format).await,
         }
@@ -365,29 +374,44 @@ impl LlmClient {
 
     async fn list_models_async(&self) -> Result<Vec<String>, LlmError> {
         let path = match self.backend {
+            Backend::OpenAiResponses => "/models",
             Backend::Ollama => "/api/tags",
             Backend::OpenAiCompatible => "/v1/models",
         };
-        let response = self
-            .http
-            .get(format!("{}{path}", self.endpoint))
-            .timeout(std::time::Duration::from_secs(3))
+        let mut request = self.http.get(format!("{}{path}", self.endpoint));
+        if self.backend == Backend::OpenAiResponses {
+            crate::responses::validate_endpoint(&self.endpoint).map_err(LlmError)?;
+            request = request.bearer_auth(crate::responses::key().await?);
+        }
+        let response = request
+            .timeout(std::time::Duration::from_secs(8))
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|error| LlmError(format!("could not list models: {error}")))?;
+            .map_err(|_| LlmError("could not reach the model list endpoint".into()))?;
+        if !response.status().is_success() {
+            return Err(if self.backend == Backend::OpenAiResponses {
+                crate::responses::status_error(response.status(), false)
+            } else {
+                LlmError(format!("model list HTTP {}", response.status()))
+            });
+        }
         let body = response_body(response, 1_048_576).await?;
         match self.backend {
             Backend::Ollama => serde_json::from_slice::<OllamaTags>(&body)
                 .map(|tags| tags.models.into_iter().map(|m| m.name).collect()),
-            Backend::OpenAiCompatible => serde_json::from_slice::<OaiModels>(&body)
-                .map(|models| models.data.into_iter().map(|m| m.id).collect()),
+            Backend::OpenAiCompatible | Backend::OpenAiResponses => {
+                serde_json::from_slice::<OaiModels>(&body)
+                    .map(|models| models.data.into_iter().map(|m| m.id).collect())
+            }
         }
         .map_err(|error| LlmError(format!("invalid model list: {error}")))
     }
 }
 
-async fn response_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, LlmError> {
+pub(crate) async fn response_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, LlmError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()

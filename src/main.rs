@@ -36,9 +36,13 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
-    /// Inference backend: ollama | llamacpp (OpenAI-compatible).
+    /// Provider: ollama, llamacpp (compatible local server), or openai (Responses API).
     #[arg(long)]
     backend: Option<String>,
+
+    /// Native OpenAI reasoning effort (cloud default: none).
+    #[arg(long)]
+    reasoning_effort: Option<String>,
 
     /// Endpoint URL (overrides GICO_ENDPOINT and config file).
     #[arg(long)]
@@ -105,6 +109,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Show aggregate OpenAI Responses request, token and cost counters.
+    Usage,
+    /// Manage the OpenAI key in the desktop Secret Service.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Show the collected context and exit.
     Context {
         /// Print collected context as JSON.
@@ -137,6 +148,12 @@ enum Cmd {
     InitZsh,
 }
 
+#[derive(Subcommand)]
+enum AuthAction {
+    Login,
+    Logout,
+}
+
 /// Runs the approved directory change in the calling Zsh process.
 const ZSH_HOOK_SNIPPET: &str = r#"# GiCo shell integration (opt-in). Add to ~/.zshrc:
 #   eval "$(gico init-zsh)"
@@ -165,7 +182,19 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     // Allow shell startup and version discovery even if the config needs repair.
     if matches!(cli.command, Some(Cmd::InitZsh)) {
-        print!("{ZSH_HOOK_SNIPPET}");
+        let cloud = gico::config::path()
+            .ok()
+            .and_then(|p| Config::load(&p).ok())
+            .is_some_and(|c| Backend::parse(&c.backend) == Some(Backend::OpenAiResponses));
+        if cloud {
+            print!(
+                "{}",
+                ZSH_HOOK_SNIPPET
+                    .replace("  command gico preload </dev/null >/dev/null 2>&1 &!\n", "")
+            );
+        } else {
+            print!("{ZSH_HOOK_SNIPPET}");
+        }
         return ExitCode::SUCCESS;
     }
     if matches!(
@@ -183,6 +212,18 @@ fn main() -> ExitCode {
             Err(e) => io_error("Zsh configuration", e),
         };
     }
+    if let Some(Cmd::Auth { ref action }) = cli.command {
+        return match match action {
+            AuthAction::Login => gico::auth::login(),
+            AuthAction::Logout => gico::auth::logout(),
+        } {
+            Ok(()) => {
+                println!("GiCo OpenAI keyring entry updated.");
+                ExitCode::SUCCESS
+            }
+            Err(e) => io_error("authentication", e),
+        };
+    }
     let path = match cli
         .config
         .clone()
@@ -196,11 +237,14 @@ fn main() -> ExitCode {
         Ok(cfg) => cfg,
         Err(e) => return io_error("configuration", e),
     };
+    if let Some(value) = &cli.backend {
+        cfg.select_backend(value);
+    }
+    if let Some(value) = &cli.reasoning_effort {
+        cfg.reasoning_effort.clone_from(value);
+    }
     if let Some(value) = &cli.model {
         cfg.model.clone_from(value);
-    }
-    if let Some(value) = &cli.backend {
-        cfg.backend.clone_from(value);
     }
     if let Some(value) = &cli.endpoint {
         cfg.endpoint.clone_from(value);
@@ -234,6 +278,17 @@ fn main() -> ExitCode {
     let engine = ContextEngine::new(engine_cfg);
 
     match cli.command {
+        Some(Cmd::Usage) => match gico::usage::read() {
+            Ok(t) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&t).expect("usage counters")
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => io_error("usage totals", e),
+        },
+        Some(Cmd::Auth { .. }) => unreachable!("handled before loading configuration"),
         Some(Cmd::Context { json }) => {
             let ctx = engine.collect("").unwrap_or_else(|e| {
                 eprintln!("gico: error collecting context: {e}");
@@ -334,6 +389,10 @@ fn main() -> ExitCode {
                     Ok(None) => println!("runner: installed, unloaded"),
                     Err(e) => return io_error("runner status", e),
                 },
+                Backend::OpenAiResponses => println!(
+                    "OpenAI Responses · reasoning {} · local preload disabled",
+                    cfg.reasoning_effort
+                ),
                 Backend::OpenAiCompatible => {
                     println!("runner: provider-managed; native preload unavailable")
                 }
@@ -510,6 +569,7 @@ fn run_request(engine: &ContextEngine, request: &str, cli: &Cli, client: LlmClie
     harness.enable_interrupts();
     let code = run_pipeline(&generator, request, &mut harness);
     if code == 0
+        && generator.client.backend == Backend::Ollama
         && cli.cd_hook_dir.is_some()
         && std::io::stdin().is_terminal()
         && std::env::var_os("GICO_TERMINAL").is_some()
@@ -530,6 +590,7 @@ fn run_request(engine: &ContextEngine, request: &str, cli: &Cli, client: LlmClie
                 match generator.client.backend {
                     Backend::Ollama => "ollama",
                     Backend::OpenAiCompatible => "llamacpp",
+                    Backend::OpenAiResponses => "openai",
                 },
                 "--endpoint",
                 &generator.client.endpoint,

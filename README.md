@@ -147,3 +147,22 @@ GiCo's original code is available under the [MIT License](LICENSE).
 The distribution also contains Apache-2.0 code from OpenAI Codex and an
 adaptation of MIT-licensed DeepSeek Harness code. See [NOTICE.md](NOTICE.md)
 and [licenses/](licenses/) for attribution and the upstream terms.
+
+### Native OpenAI Responses
+
+GiCo can use a cloud model for requests that need inference. Deterministic requests stay local. When cloud inference is used, the request and the selected project evidence go to the configured OpenAI model. GiCo still verifies the proposal and waits for Enter before executing it.
+
+In an interactive terminal, save a project API key in the desktop Secret Service and select the cloud provider:
+
+```sh
+gico auth login
+gico --backend openai setup
+gico status
+gico usage
+```
+
+Login accepts an existing `OPENAI_API_KEY` or prompts with terminal echo disabled. Linux keyring storage requires `secret-tool` and an unlocked Secret Service. An environment key takes precedence. Use `gico auth logout` to remove the stored entry.
+
+The native backend uses `https://api.openai.com/v1/responses`, with `gpt-6-luna` and reasoning effort `none` by default. Set `--reasoning-effort low` for an individual request or persist it with `setup`. Select a stronger model explicitly with `gico --backend openai --model gpt-6.1-terra --reasoning-effort low "your request"`. Model access depends on the API project. Cloud usage has no local model preload. Usage counters report provider-returned tokens and an estimate at standard short-context list prices.
+
+Use `gico --backend ollama "your request"` for local inference or `gico --backend ollama setup` to restore the saved local selection. A provider error is reported to the terminal. GiCo only switches providers when selected.

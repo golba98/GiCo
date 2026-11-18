@@ -1802,11 +1802,11 @@ fn main() {
     let args = Args::parse();
     let mut cfg = Config::load(&gico::config::path().expect("config path"))
         .expect("valid GiCo configuration");
+    if let Some(value) = args.backend {
+        cfg.select_backend(&value);
+    }
     if let Some(value) = args.model {
         cfg.model = value;
-    }
-    if let Some(value) = args.backend {
-        cfg.backend = value;
     }
     if let Some(value) = args.endpoint {
         cfg.endpoint = value;
