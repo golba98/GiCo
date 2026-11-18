@@ -323,7 +323,7 @@ fn navigation_combines_the_project_name_and_documented_purpose() {
         ])
         .env("HOME", home.path())
         .env("XDG_DATA_HOME", home.path().join("data"))
-        .current_dir(home.path())
+        .current_dir(std::env::temp_dir())
         .output()
         .unwrap();
     let output: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();

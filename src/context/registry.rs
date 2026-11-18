@@ -340,10 +340,28 @@ fn contains_name(request: &str, name: &str) -> bool {
 
 /// A bounded shared inventory for both project tasks and directory navigation.
 fn workspace_places(cwd: &Path) -> (Vec<PathBuf>, bool) {
-    let mut roots = vec![cwd.to_owned()];
-    if let Ok(home) = config::home() {
-        roots.push(home.join("Development"));
-        // Only immediate everyday folders from HOME belong to the inventory.
+    let home = config::home().ok();
+    let mut roots = Vec::new();
+    if let Some(home) = &home {
+        roots.push((home.join("Development"), 0));
+    }
+    if let Ok(path) = config::path() {
+        if let Ok(config) = config::Config::load(&path) {
+            roots.extend(
+                config
+                    .workspace_roots
+                    .into_iter()
+                    .filter(|p| p.is_absolute())
+                    .take(12)
+                    .map(|p| (p, 0)),
+            );
+        }
+    }
+    // A broad system working directory such as /tmp is not a workspace root.
+    // Its entries must not consume the configured workspace's search budget.
+    let scoped_cwd = home.as_ref().is_some_and(|home| cwd.starts_with(home)) || manifest(cwd);
+    roots.push((cwd.to_owned(), if scoped_cwd { 0 } else { 3 }));
+    if let Some(home) = &home {
         roots.extend(
             home.read_dir()
                 .into_iter()
@@ -355,35 +373,14 @@ fn workspace_places(cwd: &Path) -> (Vec<PathBuf>, bool) {
                         && !e.file_name().to_string_lossy().starts_with('.')
                 })
                 .map(|e| e.path())
-                .filter(|p| !p.starts_with(home.join("Development")))
-                .take(32),
+                .take(32)
+                .map(|p| (p, 3)),
         );
     }
-    if let Ok(path) = config::path() {
-        if let Ok(config) = config::Config::load(&path) {
-            roots.extend(
-                config
-                    .workspace_roots
-                    .into_iter()
-                    .filter(|p| p.is_absolute())
-                    .take(12),
-            );
-        }
-    }
-    let mut pending = std::collections::VecDeque::new();
-    for root in roots {
-        if let Ok(root) = root.canonicalize() {
-            let depth = if root == cwd
-                || root.ends_with("Development")
-                || !config::home().is_ok_and(|home| root.parent() == Some(&home))
-            {
-                0
-            } else {
-                3
-            };
-            pending.push_back((root, depth));
-        }
-    }
+    let mut pending: std::collections::VecDeque<_> = roots
+        .into_iter()
+        .filter_map(|(root, depth)| root.canonicalize().ok().map(|path| (path, depth)))
+        .collect();
     let mut visited = std::collections::BTreeSet::new();
     let mut places = Vec::new();
     let mut budget = 4000;
@@ -392,7 +389,7 @@ fn workspace_places(cwd: &Path) -> (Vec<PathBuf>, bool) {
             continue;
         }
         places.push(dir.clone());
-        if depth >= 3 || config::home().is_ok_and(|home| dir == home) {
+        if depth >= 3 || home.as_ref() == Some(&dir) {
             continue;
         }
         let Ok(entries) = dir.read_dir() else {
