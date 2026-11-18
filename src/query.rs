@@ -711,6 +711,8 @@ impl Query {
                     Transform::JsonKey(key) => {
                         format!("jq -r --arg key {} '.[$key]' -- {f}", shell_quote(key))
                     }
+                    // Characters denote Unicode code points even in a C-locale shell.
+                    Transform::Count("-m") => format!("LC_ALL=C.UTF-8 wc -m < {f}"),
                     Transform::Count(flag) => format!("wc {flag} < {f}"),
                     Transform::DistinctCount => format!("sort -u -- {f} | wc -l"),
                     Transform::Slice { end, amount, unit } => {

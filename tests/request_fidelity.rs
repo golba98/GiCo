@@ -204,3 +204,22 @@ fn command_options_and_predicates_are_not_input_paths() {
         pipeline::Preparation::Clarify(_)
     ));
 }
+
+#[test]
+fn character_count_is_independent_of_the_calling_shell_locale() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("ink"), "é🖊").unwrap();
+    for (unit, expected) in [("characters", "2"), ("bytes", "6")] {
+        let request = format!("count {unit} in ink");
+        let plan = candidate(dir.path(), &request, None);
+        assert_ne!(plan.report.verdict(), Verdict::Blocked);
+        let out = Command::new("sh")
+            .args(["-c", &plan.command])
+            .env("LC_ALL", "C")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), expected);
+    }
+}
